@@ -3,7 +3,7 @@
 extract_meta.py
 
 Provides functions to discover media and JSON sidecar files, match JSON to media
-by internal title, and extract timestamps from EXIF (ModifyDate) and JSON (photoTakenTime).
+by internal title, and extract timestamps from EXIF (CreateDate) and JSON (photoTakenTime).
 Also includes a filename-based fallback date parser.
 """
 
@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 from tqdm import tqdm
+from PIL import Image
+from imagehash import phash, dhash
 
 # Supported media file extensions
 MEDIA_EXTENSIONS = {
@@ -101,15 +103,15 @@ def match_json_for_media(media_file_path: Path, json_file_paths: List[Path]) -> 
     return title_map.get(stripped_stem)
 
 
-def extract_exif_modify_date(media_file_path: Path) -> Optional[str]:
+def extract_exif_create_date(media_file_path: Path) -> Optional[str]:
     """
-    Use ExifTool to read the EXIF ModifyDate tag and return it in UTC ISO format.
+    Use ExifTool to read the EXIF CreateDate tag and return it in UTC ISO format.
     Returns None if not found or on error.
     """
     try:
         output = subprocess.check_output(
             [
-                "exiftool", "-s3", "-ModifyDate", str(media_file_path)
+                "exiftool", "-s3", "-CreateDate", str(media_file_path)
             ], stderr=subprocess.DEVNULL
         ).decode().strip()
         if not output:
@@ -123,21 +125,17 @@ def extract_exif_modify_date(media_file_path: Path) -> Optional[str]:
         return None
 
 
-def extract_json_taken_date(media_file_path: Path) -> Optional[str]:
+def extract_json_taken_date(media_file_path: Path, json_file_paths: List[Path]) -> Optional[str]:
     """
-    Read JSON sidecar's photoTakenTime or creationTime timestamp (matching any .json
-    starting with the media filename), return UTC ISO string.
-    Returns None if no sidecar or timestamp.
+    Read JSON sidecar's photoTakenTime or creationTime timestamp by matching
+    via internal title map. Returns UTC ISO string or None.
     """
-    parent_dir = media_file_path.parent
-    filename = media_file_path.name
-    # match any JSON file beginning with the media filename
-    json_candidates = list(parent_dir.glob(f"{filename}*.json"))
-    if not json_candidates:
+    # Find the correct JSON sidecar
+    matched_json = match_json_for_media(media_file_path, json_file_paths)
+    if not matched_json:
         return None
-    json_path = json_candidates[0]
     try:
-        sidecar = json.loads(json_path.read_text(encoding="utf-8"))
+        sidecar = json.loads(Path(matched_json).read_text(encoding="utf-8"))
         timestamp = (
             sidecar.get("photoTakenTime", {}).get("timestamp")
             or sidecar.get("creationTime", {}).get("timestamp")
@@ -192,3 +190,17 @@ def correct_file_extension_by_mime(media_file_path: Path) -> Path:
     except Exception:
         pass
     return media_file_path
+
+
+# Perceptual hash utilities
+def compute_perceptual_hashes(media_file_path: Path) -> tuple[str, str]:
+    """
+    Compute perceptual pHash and dHash for the given media file.
+    Returns a tuple (pHash, dHash) as hex strings, or (None, None) on error.
+    """
+    try:
+        image = Image.open(media_file_path).convert("RGB")
+        return str(phash(image)), str(dhash(image))
+    except Exception:
+        return None, None
+
