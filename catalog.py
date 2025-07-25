@@ -27,9 +27,12 @@ def initialize_database(database_path: Path = DATABASE_FILE) -> sqlite3.Connecti
             id INTEGER PRIMARY KEY,
             filepath TEXT UNIQUE NOT NULL,
             jsonpath TEXT,
-            exif_modify_date TEXT,
+            exif_create_date TEXT,
             json_taken_date TEXT,
             filename_parsed_date TEXT,
+            phash TEXT,
+            dhash TEXT,
+            ssim_score REAL,
             chosen_date TEXT
         )
         """
@@ -62,14 +65,14 @@ def update_json_path(connection: sqlite3.Connection, media_file_path: Path, json
     connection.commit()
 
 
-def update_exif_modify_date(connection: sqlite3.Connection, media_file_path: Path, modify_date: str) -> None:
+def update_exif_create_date(connection: sqlite3.Connection, media_file_path: Path, create_date: str) -> None:
     """
-    Store the EXIF ModifyDate (the camera’s recorded timestamp).
+    Store the EXIF CreateDate (the camera’s recorded timestamp).
     """
     cursor = connection.cursor()
     cursor.execute(
-        "UPDATE media SET exif_modify_date = ? WHERE filepath = ?",
-        (modify_date, str(media_file_path))
+        "UPDATE media SET exif_create_date = ? WHERE filepath = ?",
+        (create_date, str(media_file_path))
     )
     connection.commit()
 
@@ -114,17 +117,56 @@ def update_chosen_date(connection: sqlite3.Connection, media_file_path: Path, ch
     connection.commit()
 
 
+# --- Perceptual hash and SSIM update helpers ---
+def update_phash(connection: sqlite3.Connection, media_file_path: Path, perceptual_hash: str) -> None:
+    """
+    Store the perceptual pHash for a given media file.
+    """
+    cursor = connection.cursor()
+    cursor.execute(
+        "UPDATE media SET phash = ? WHERE filepath = ?",
+        (perceptual_hash, str(media_file_path))
+    )
+    connection.commit()
+
+
+def update_dhash(connection: sqlite3.Connection, media_file_path: Path, difference_hash: str) -> None:
+    """
+    Store the perceptual dHash for a given media file.
+    """
+    cursor = connection.cursor()
+    cursor.execute(
+        "UPDATE media SET dhash = ? WHERE filepath = ?",
+        (difference_hash, str(media_file_path))
+    )
+    connection.commit()
+
+
+def update_ssim_score(connection: sqlite3.Connection, media_file_path: Path, score: float) -> None:
+    """
+    Store the SSIM similarity score for a given media file.
+    """
+    cursor = connection.cursor()
+    cursor.execute(
+        "UPDATE media SET ssim_score = ? WHERE filepath = ?",
+        (score, str(media_file_path))
+    )
+    connection.commit()
+
+
 def fetch_all_media_entries(connection: sqlite3.Connection) -> list[tuple]:
     """
     Return a list of all rows with:
-    (filepath, jsonpath, exif_modify_date, json_taken_date,
+    (filepath, jsonpath, exif_create_date, json_taken_date,
      filename_parsed_date, chosen_date)
     """
     cursor = connection.cursor()
     cursor.execute(
         """
-        SELECT filepath, jsonpath, exif_modify_date,
-               json_taken_date, filename_parsed_date, chosen_date
+        SELECT filepath, jsonpath, exif_create_date,
+               json_taken_date, filename_parsed_date,
+               phash, dhash, ssim_score,
+               chosen_date
         FROM media
         """
     )
