@@ -1,0 +1,184 @@
+Byte-compiled / optimized / DLL files
+
+pycache/
+*.py[cod]
+*$py.class
+
+C extensions
+
+*.so
+
+Distribution / packaging
+
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+Installer logs
+
+pip-log.txt
+pip-delete-this-directory.txt
+
+Unit test / coverage reports
+
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+Jupyter Notebook
+
+.ipynb_checkpoints
+
+pyenv
+
+.python-version
+
+mypy
+
+.mypy_cache/
+
+VS Code settings
+
+.vscode/
+
+macOS
+
+.DS_Store
+
+Logs and databases
+
+logs/
+*.db
+media_catalog.db
+
+Backup and temp files
+
+*~
+*.bak
+*.swp
+
+Sample output folders
+
+output/
+Final/
+
+Shell scripts
+
+*.sh
+
+ExifTool sidecar jsons
+
+you might want to track these, but often large
+
+#*.json
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Python virtual environments and config
+.Python
+env/
+venv/
+ENV/
+.venv/
+.env/
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# pyenv
+.python-version
+
+# mypy
+.mypy_cache/
+
+# IDE settings
+.vscode/
+.idea/
+
+# macOS system files
+.DS_Store
+
+# Logs and database files
+logs/
+*.db
+media_catalog.db
+
+# Backup and temp files
+*~
+*.bak
+*.swp
+
+# Output directories
+output/
+Final/
+
+# Log files
+*.log
+
+# Lock files
+Pipfile.lock
+poetry.lock
+
+# ExifTool sidecar JSONs (uncomment to ignore)
+# *.json
