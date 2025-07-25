@@ -7,7 +7,7 @@ Orchestrator for the Google Takeout Photo Organizer pipeline.
 Steps:
 1. Initialize SQLite catalog.
 2. Scan the target directory for media files and JSON sidecars.
-3. Extract EXIF ModifyDate and JSON photoTakenTime for each file.
+3. Extract EXIF CreateDate and JSON photoTakenTime for each file.
 4. Parse fallback dates from filenames.
 5. Choose the final timestamp per file.
 6. Rename or move files into date-based folders.
@@ -39,21 +39,19 @@ def prompt_for_directory(prompt_message: str) -> Path:
 
 
 def main():
-    # 1) Determine target directory
-    if len(sys.argv) > 1:
-        target_directory = Path(sys.argv[1]).expanduser()
-    else:
-        target_directory = Path(os.getenv("TARGET_DIR", "")).expanduser()
-        if not target_directory.is_dir():
-            target_directory = prompt_for_directory(
-                "Enter path to your Google Takeout folder"
-            )
+    """# 1) Determine target directory
+    target_directory = prompt_for_directory(
+        "Enter path to your Google Takeout folder"
+    )
 
     # 2) Determine output directory
     output_directory = prompt_for_directory(
         "Enter path to the folder where organized files will be saved"
-    )
+    )"""
 
+    target_directory = Path('/Users/kamil1/Pictures/teste').expanduser()
+    output_directory = Path('/Users/kamil1/Pictures/teste/final').expanduser()
+    
     # 3) Initialize database
     connection = catalog.initialize_database()
 
@@ -84,12 +82,12 @@ def main():
 
     # 7) Extract timestamps from EXIF and JSON
     for media_file_path in tqdm(media_file_paths, desc="Extracting timestamps", unit="file"):
-        modify_date = extract_meta.extract_exif_modify_date(media_file_path)
-        if modify_date:
-            catalog.update_exif_modify_date(
-                connection, media_file_path, modify_date
+        create_date = extract_meta.extract_exif_create_date(media_file_path)
+        if create_date:
+            catalog.update_exif_create_date(
+                connection, media_file_path, create_date
             )
-        json_taken_date = extract_meta.extract_json_taken_date(media_file_path)
+        json_taken_date = extract_meta.extract_json_taken_date(media_file_path, json_file_paths)
         if json_taken_date:
             catalog.update_json_taken_date(
                 connection, media_file_path, json_taken_date
@@ -110,6 +108,19 @@ def main():
 
     # 10) Rename or move files based on the chosen timestamp
     reorganize.reorganize_files(connection, output_directory)
+
+    # 12) (Optional) Detect and segregate near-duplicate edits
+    if input("🔍 Run dedupe pass? [y/N] ").strip().lower().startswith("y"):
+        # Move duplicates into a subfolder called "duplicates"
+        duplicates_folder = output_directory / "duplicates"
+        # Use subprocess so we can pass the folder
+        import subprocess
+        subprocess.run([
+            "python3",  # or "./dedupe.py" if you made it executable
+            "dedupe.py",
+            str(output_directory),
+            "--move", str(duplicates_folder)
+        ])
 
     # 11) Optional cleanup of empty folders
     if input("🧹 Remove empty folders? [y/N] ").strip().lower().startswith("y"):
