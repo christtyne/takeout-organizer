@@ -6,7 +6,7 @@ choose_timestamp.py
 
 Choose the final 'chosen_date' for each media entry in the SQLite catalog
 based on priority:
-  1. EXIF ModifyDate (most reliable)
+  1. EXIF CreateDate (most reliable)
   2. JSON photoTakenTime (fallback)
   3. Filename-parsed date
 """
@@ -18,12 +18,12 @@ from tqdm import tqdm
 def choose_timestamp_for_all(connection: sqlite3.Connection) -> None:
     """
     For each media record, select the oldest available timestamp among
-    exif_modify_date, json_taken_date, and filename_parsed_date, then
+    exif_create_date, json_taken_date, and filename_parsed_date, then
     update the chosen_date field.
     """
     cursor = connection.cursor()
     cursor.execute("""
-        SELECT filepath, exif_modify_date, json_taken_date, filename_parsed_date
+        SELECT filepath, exif_create_date, json_taken_date, filename_parsed_date
         FROM media
     """)
     rows = cursor.fetchall()
