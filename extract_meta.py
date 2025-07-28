@@ -39,6 +39,10 @@ MIME_EXTENSION_MAP = {
     "video/x-m4v":  ".m4v",
 }
 
+# Processed/errored JSON folder names
+PROCESSED_JSON_DIR_NAME = "json_processed"
+ERROR_JSON_DIR_NAME = "json_error"
+
 # JSON sidecar filename suffixes to ignore
 IGNORE_JSON_SUFFIXES = {".db", ".txt", ".md"}
 
@@ -128,25 +132,42 @@ def extract_exif_create_date(media_file_path: Path) -> Optional[str]:
 def extract_json_taken_date(media_file_path: Path, json_file_paths: List[Path]) -> Optional[str]:
     """
     Read JSON sidecar's photoTakenTime or creationTime timestamp by matching
-    via internal title map. Returns UTC ISO string or None.
+    via internal title map. Returns UTC ISO string or None. Moves sidecars to
+    processed or error folders based on success.
     """
     # Find the correct JSON sidecar
     matched_json = match_json_for_media(media_file_path, json_file_paths)
     if not matched_json:
         return None
+    
+
+    json_path = Path(matched_json)
     try:
-        sidecar = json.loads(Path(matched_json).read_text(encoding="utf-8"))
+        sidecar = json.loads(json_path.read_text(encoding="utf-8"))
         timestamp = (
             sidecar.get("photoTakenTime", {}).get("timestamp")
             or sidecar.get("creationTime", {}).get("timestamp")
         )
         if not timestamp:
-            return None
-        taken_datetime = datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
-        return taken_datetime.isoformat()
-    except Exception:
-        return None
+            raise ValueError("No timestamp in JSON sidecar")
 
+        # Move to processed folder
+        processed_dir = json_path.parent / PROCESSED_JSON_DIR_NAME
+        processed_dir.mkdir(exist_ok=True)
+        json_path.rename(processed_dir / json_path.name)
+
+        taken_dt = datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
+        return taken_dt.isoformat()
+
+    except Exception:
+        # Move to error folder
+        error_dir = json_path.parent / ERROR_JSON_DIR_NAME
+        error_dir.mkdir(exist_ok=True)
+        try:
+            json_path.rename(error_dir / json_path.name)
+        except Exception:
+            pass
+        return None
 
 
 def parse_date_from_filename(filename_stem: str) -> Optional[str]:
