@@ -6,16 +6,11 @@ Detect and optionally move duplicate or near-duplicate images in a directory
 using perceptual hashes (pHash & dHash) plus SSIM for visual similarity.
 
 Usage:
-  # Print duplicates only
-  python dedupe.py /path/to/organized
-
-  # Move all duplicates (keeping the first-occurrence) into ./duplicates
-  python dedupe.py /path/to/organized --move ./duplicates
+  # This module expects an existing SQLite connection and does not open one itself.
 """
 
-import argparse
-import shutil
 from pathlib import Path
+import shutil
 
 from PIL import Image
 import numpy as np
@@ -23,20 +18,44 @@ from imagehash import phash, dhash
 import cv2
 from skimage.metrics import structural_similarity as ssim
 
+import logging
+
+# Ensure a logs directory exists next to this script
+LOGS_DIR = Path(__file__).parent / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+
+# Configure logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+log_file = LOGS_DIR / "hash_duplicates.log"
+handler = logging.FileHandler(log_file, encoding="utf-8")
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(handler)
+
 # Tunable thresholds
 PHASH_THRESHOLD = 3     # hamming distance
 DHASH_THRESHOLD = 3     # hamming distance
-SSIM_THRESHOLD  = 0.98  # SSIM score (0–1)
+SSIM_THRESHOLD  = 0.95  # SSIM score (0–1)
 
 
-def compute_hashes(image_path: Path):
-    """Return (pHash, dHash) for the given image."""
-    img = Image.open(image_path).convert("RGB")
-    return phash(img), dhash(img)
-
+# Perceptual hash utilities
+def compute_perceptual_hashes(media_file_path: Path) -> tuple[str, str]:
+    """
+    Compute perceptual pHash and dHash for the given media file.
+    Returns a tuple (pHash, dHash) as hex strings, or (None, None) on error.
+    """
+    try:
+        image = Image.open(media_file_path).convert("RGB")
+        return str(phash(image)), str(dhash(image))
+    except Exception as err:
+        logger.error(f"Failed computing perceptual hashes for {media_file_path}: {err}")
+        return None, None
 
 def compute_ssim(path_a: Path, path_b: Path) -> float:
-    """Return SSIM score between two images, after resizing to match."""
+    """Return SSIM score between two images, after resizing to match.
+        SSIM ≥ 0.98 ⇒ near-identical pixels (an “edit”)
+	    SSIM < 0.95 ⇒ probably a genuinely different shot    
+    """
     a = cv2.imread(str(path_a), cv2.IMREAD_GRAYSCALE)
     b = cv2.imread(str(path_b), cv2.IMREAD_GRAYSCALE)
     if a is None or b is None:
@@ -49,41 +68,40 @@ def compute_ssim(path_a: Path, path_b: Path) -> float:
     return score
 
 
-def find_duplicates(root_dir: Path, move_to: Path = None):
+def find_duplicates(connection, root_dir: Path, move_to: Path = None):
     """
-    Scan root_dir for images, compare each pair by pHash/dHash + SSIM,
-    and either print duplicates or move them to move_to.
+    Scan root_dir for duplicate images using perceptual hashes and file sizes
+    stored in the provided SQLite connection's 'media' table.
     """
-    # 1) Gather all image files
-    media_extensions = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
-    files = [p for p in root_dir.rglob("*") if p.suffix.lower() in media_extensions]
-
-    # 2) Compute perceptual hashes for each file
-    hashes = {}
-    for path in files:
-        try:
-            hashes[path] = compute_hashes(path)
-        except Exception as err:
-            print(f"⚠️  Failed hashing {path.name}: {err}")
+    # 1) Query catalog for files with hashes
+    cursor = connection.cursor()
+    cursor.execute(
+        "SELECT filepath, phash, dhash FROM media WHERE phash IS NOT NULL AND dhash IS NOT NULL"
+    )
+    entries = []
+    for filepath_str, phash_str, dhash_str in cursor.fetchall():
+        file_path = Path(filepath_str)
+        if file_path.exists():
+            entries.append((file_path, phash_str, dhash_str))
 
     duplicates = []
     visited = set()
 
-    # 3) Compare each file to subsequent ones
-    for i, first in enumerate(files):
+    # 2) Compare each file to subsequent ones
+    for i, (first, phash1_str, dhash1_str) in enumerate(entries):
         if first in visited:
             continue
-        ph1, dh1 = hashes.get(first, (None, None))
-        for second in files[i+1:]:
+        ph1 = int(phash1_str, 16)
+        dh1 = int(dhash1_str, 16)
+        for second, phash2_str, dhash2_str in entries[i+1:]:
             if second in visited:
                 continue
-            ph2, dh2 = hashes.get(second, (None, None))
-            if ph1 is None or ph2 is None:
-                continue
+            ph2 = int(phash2_str, 16)
+            dh2 = int(dhash2_str, 16)
 
-            # 3a) Check Hamming distances
-            if abs(ph1 - ph2) <= PHASH_THRESHOLD and abs(dh1 - dh2) <= DHASH_THRESHOLD:
-                # 3b) Verify with SSIM
+            # 2a) Check Hamming distances
+            if bin(ph1 ^ ph2).count("1") <= PHASH_THRESHOLD and bin(dh1 ^ dh2).count("1") <= DHASH_THRESHOLD:
+                # 2b) Verify with SSIM
                 sim_score = compute_ssim(first, second)
                 if sim_score >= SSIM_THRESHOLD:
                     duplicates.append((first, second, sim_score))
@@ -91,39 +109,29 @@ def find_duplicates(root_dir: Path, move_to: Path = None):
 
         visited.add(first)
 
-    # 4) Report or move
+    # 3) Report or move
     if move_to:
         move_to.mkdir(parents=True, exist_ok=True)
         for keep, dup, score in duplicates:
-            dest = move_to / dup.name
-            shutil.move(str(dup), str(dest))
-        print(f"➡️  Moved {len(duplicates)} duplicates into {move_to}")
+            # Build new filename with "_duplicate" suffix
+            new_name = f"{dup.stem}_duplicate{dup.suffix}"
+            dest = move_to / new_name
+            try:
+                shutil.move(str(dup), str(dest))
+                logger.info(f"Renamed and moved duplicate {dup} → {dest}")
+            except Exception as error:
+                logger.error(f"Failed to move duplicate {dup}: {error}")
     else:
         for keep, dup, score in duplicates:
-            print(f"Duplicate: {dup}  ← visually matches {keep}  (SSIM={score:.3f})")
-        print(f"\n⚠️  Found {len(duplicates)} duplicate(s).")
+            # Rename in place with "_duplicate" suffix
+            new_name = f"{dup.stem}_duplicate{dup.suffix}"
+            new_path = dup.parent / new_name
+            try:
+                dup.rename(new_path)
+                logger.info(f"Marked duplicate {dup} → {new_path}")
+                print(f"🔖 Marked duplicate: {new_path}  ← visually matches {keep}  (SSIM={score:.3f})")
+            except Exception as error:
+                logger.error(f"Failed renaming duplicate {dup}: {error}")
+        print(f"\n⚠️  Found and renamed {len(duplicates)} duplicate(s).")
 
     return duplicates
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Find duplicate images by hash + SSIM")
-    parser.add_argument("directory", help="Root directory of organized media")
-    parser.add_argument(
-        "--move", "-m",
-        help="If set, move detected duplicates into this folder",
-        dest="move_dir",
-        metavar="DUP_DIR"
-    )
-    args = parser.parse_args()
-
-    root = Path(args.directory).expanduser()
-    if not root.is_dir():
-        parser.error(f"Directory not found: {root}")
-
-    move_target = Path(args.move_dir).expanduser() if args.move_dir else None
-    find_duplicates(root, move_to=move_target)
-
-
-if __name__ == "__main__":
-    main()
