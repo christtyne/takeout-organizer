@@ -8,15 +8,26 @@ Also includes a filename-based fallback date parser.
 """
 
 import json
+import os
 import re
 import subprocess
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 from tqdm import tqdm
-from PIL import Image
-from imagehash import phash, dhash
+import logging
+
+# Ensure a logs directory exists next to this script
+LOGS_DIR = Path(__file__).parent / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+
+# Configure logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+log_file = LOGS_DIR / "extract_meta.log"
+handler = logging.FileHandler(log_file, encoding="utf-8")
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(handler)
 
 # Supported media file extensions
 MEDIA_EXTENSIONS = {
@@ -47,9 +58,12 @@ ERROR_JSON_DIR_NAME = "json_error"
 IGNORE_JSON_SUFFIXES = {".db", ".txt", ".md"}
 
 # Regex for parsing dates out of filenames, e.g. IMG_20220101_123456
+
+    #r"^(?P<year>\d{4})[-_.]?(?P<month>\d{2})[-_.]?(?P<day>\d{2})"
+    #r"[_-]?(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})$"
 FILENAME_DATE_PATTERN = re.compile(
-    r"^(?P<year>\d{4})[-_.]?(?P<month>\d{2})[-_.]?(?P<day>\d{2})"
-    r"[_-]?(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})$"
+    r"(?P<year>\d{4})[-_.]?(?P<month>\d{2})[-_.]?(?P<day>\d{2})[ _-]?"
+    r"(?P<hour>\d{2})(?:[:.]?)(?P<minute>\d{2})(?:[:.]?)(?P<second>\d{2})"
 )
 
 
@@ -112,21 +126,26 @@ def extract_exif_create_date(media_file_path: Path) -> Optional[str]:
     Use ExifTool to read the EXIF CreateDate tag and return it in UTC ISO format.
     Returns None if not found or on error.
     """
-    try:
-        output = subprocess.check_output(
-            [
-                "exiftool", "-s3", "-CreateDate", str(media_file_path)
-            ], stderr=subprocess.DEVNULL
-        ).decode().strip()
-        if not output:
-            return None
-        # Parse "YYYY:MM:DD HH:MM:SS" into datetime
-        naive_datetime = datetime.strptime(output, "%Y:%m:%d %H:%M:%S")
-        # Assume local time of original; convert to UTC
-        aware_datetime = naive_datetime.replace(tzinfo=timezone.utc)
-        return aware_datetime.isoformat()
-    except Exception:
-        return None
+    logger.debug(f"Extracting EXIF CreateDate for {media_file_path}")
+
+    for tag in ("CreateDate", "DateTimeOriginal", "ModifyDate"):
+        try:
+            output = subprocess.check_output(
+                [
+                    "exiftool", "-s3", f"-{tag}", str(media_file_path)
+                ], stderr=subprocess.DEVNULL
+            ).decode().strip()
+            if not output:
+                continue
+            # Parse "YYYY:MM:DD HH:MM:SS" into datetime
+            naive_datetime = datetime.strptime(output, "%Y:%m:%d %H:%M:%S")
+            # Assume local time of original; convert to UTC
+            aware_datetime = naive_datetime.replace(tzinfo=timezone.utc)
+            return aware_datetime.isoformat()
+        except Exception:
+            continue
+    logger.warning(f"No EXIF CreateDate/DateTimeOriginal/ModifyDate found for {media_file_path}")
+    return None
 
 
 def extract_json_taken_date(media_file_path: Path, json_file_paths: List[Path]) -> Optional[str]:
@@ -135,12 +154,19 @@ def extract_json_taken_date(media_file_path: Path, json_file_paths: List[Path]) 
     via internal title map. Returns UTC ISO string or None. Moves sidecars to
     processed or error folders based on success.
     """
+    #logger.debug(f"Extracting JSON timestamp for {media_file_path}")
+        # Determine a single root directory for all JSON sidecars
+    if json_file_paths:
+        common_root = Path(os.path.commonpath([str(p.parent) for p in json_file_paths]))
+    else:
+        common_root = media_file_path.parent
+
     # Find the correct JSON sidecar
     matched_json = match_json_for_media(media_file_path, json_file_paths)
     if not matched_json:
+        logger.warning(f"No JSON sidecar matched for {media_file_path}")
         return None
     
-
     json_path = Path(matched_json)
     try:
         sidecar = json.loads(json_path.read_text(encoding="utf-8"))
@@ -149,10 +175,11 @@ def extract_json_taken_date(media_file_path: Path, json_file_paths: List[Path]) 
             or sidecar.get("creationTime", {}).get("timestamp")
         )
         if not timestamp:
+            logger.warning(f"No timestamp field in JSON sidecar {json_path}")
             raise ValueError("No timestamp in JSON sidecar")
 
-        # Move to processed folder
-        processed_dir = json_path.parent / PROCESSED_JSON_DIR_NAME
+        # Move to processed folder in the common root
+        processed_dir = common_root / PROCESSED_JSON_DIR_NAME
         processed_dir.mkdir(exist_ok=True)
         json_path.rename(processed_dir / json_path.name)
 
@@ -160,13 +187,13 @@ def extract_json_taken_date(media_file_path: Path, json_file_paths: List[Path]) 
         return taken_dt.isoformat()
 
     except Exception:
-        # Move to error folder
-        error_dir = json_path.parent / ERROR_JSON_DIR_NAME
+        # Move to error folder in the common root
+        error_dir = common_root / ERROR_JSON_DIR_NAME
         error_dir.mkdir(exist_ok=True)
         try:
             json_path.rename(error_dir / json_path.name)
         except Exception:
-            pass
+            logger.exception(f"Failed to extract JSON timestamp for {media_file_path}")
         return None
 
 
@@ -175,8 +202,10 @@ def parse_date_from_filename(filename_stem: str) -> Optional[str]:
     Parse a fallback date from filename patterns like YYYYMMDD_HHMMSS.
     Returns an ISO8601 date string or None.
     """
-    match = FILENAME_DATE_PATTERN.match(filename_stem)
+    #logger.debug(f"Parsing date from filename stem: {filename_stem}")
+    match = FILENAME_DATE_PATTERN.search(filename_stem)
     if not match:
+        logger.warning(f"No date pattern found in filename: {filename_stem}")
         return None
     parts = match.groupdict()
     try:
@@ -211,17 +240,4 @@ def correct_file_extension_by_mime(media_file_path: Path) -> Path:
     except Exception:
         pass
     return media_file_path
-
-
-# Perceptual hash utilities
-def compute_perceptual_hashes(media_file_path: Path) -> tuple[str, str]:
-    """
-    Compute perceptual pHash and dHash for the given media file.
-    Returns a tuple (pHash, dHash) as hex strings, or (None, None) on error.
-    """
-    try:
-        image = Image.open(media_file_path).convert("RGB")
-        return str(phash(image)), str(dhash(image))
-    except Exception:
-        return None, None
 
