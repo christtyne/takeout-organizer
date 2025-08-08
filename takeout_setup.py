@@ -23,7 +23,8 @@ import catalog
 import extract_meta
 import choose_timestamp
 import reorganize
-import clean_empty_folders
+from clean_empty_folders import clean_empty_folders
+import dedupe 
 
 from tqdm import tqdm
 
@@ -53,11 +54,20 @@ def main():
     output_directory = Path('/Users/kamil1/Pictures/teste/final').expanduser()
     
     # 3) Initialize database
+    print(f"\nCreating database")
     connection = catalog.initialize_database()
 
-    # 4) Discover all media files and JSON sidecars
-    media_file_paths = extract_meta.find_media_files(target_directory)
-    json_file_paths = extract_meta.find_json_files(target_directory)
+    # 4) Discover media files with progress bar
+    print("\nScanning for media files...")
+    media_iterator = extract_meta.find_media_files(target_directory)
+    media_file_paths = list(tqdm(media_iterator, desc="Finding media files", unit="file"))
+    print(f"✅ Found {len(media_file_paths)} media files")
+
+    # 4b) Discover JSON sidecars with progress bar
+    print("\nScanning for JSON sidecars...")
+    json_iterator = extract_meta.find_json_files(target_directory)
+    json_file_paths = list(tqdm(json_iterator, desc="Finding JSON files", unit="file"))
+    print(f"✅ Found {len(json_file_paths)} JSON files")
 
     # Correct any mismatched extensions in place
     corrected_media_paths = []
@@ -104,27 +114,31 @@ def main():
             )
 
     # 9) Choose the final timestamp for each entry
-    choose_timestamp.choose_timestamp_for_all(connection)
+        for _ in tqdm(range(1), desc="Choosing timestamps", unit="step"):
+            choose_timestamp.choose_timestamp_for_all(connection)
 
-    # 10) Rename or move files based on the chosen timestamp
-    reorganize.reorganize_files(connection, output_directory)
+    # 10) Compute and store perceptual hashes (pHash & dHash)
+    for media_file_path in tqdm(media_file_paths, desc="Hashing images", unit="file"):
+        perceptual_hash, difference_hash = dedupe.compute_perceptual_hashes(media_file_path)
+        if perceptual_hash:
+            catalog.update_phash(connection, media_file_path, perceptual_hash)
+        if difference_hash:
+            catalog.update_dhash(connection, media_file_path, difference_hash)
 
-    # 12) (Optional) Detect and segregate near-duplicate edits
-    if input("🔍 Run dedupe pass? [y/N] ").strip().lower().startswith("y"):
-        # Move duplicates into a subfolder called "duplicates"
-        duplicates_folder = output_directory / "duplicates"
-        # Use subprocess so we can pass the folder
-        import subprocess
-        subprocess.run([
-            "python3",  # or "./dedupe.py" if you made it executable
-            "dedupe.py",
-            str(output_directory),
-            "--move", str(duplicates_folder)
-        ])
+    # 11) Deduplication pass
+    print("\n🔍 Running dedupe pass and renaming duplicates in place")
+    for _ in tqdm(range(1), desc="Analising files for duplicates", unit="step"):
+        dedupe.find_duplicates(connection, output_directory)
 
-    # 11) Optional cleanup of empty folders
+    # 12) Move files based on the chosen timestamp
+    for _ in tqdm(range(1), desc="Reorganizing files", unit="file"):
+        reorganize.reorganize_files(connection, output_directory)
+
+    # 13) Optional cleanup of empty folders
     if input("🧹 Remove empty folders? [y/N] ").strip().lower().startswith("y"):
-        clean_empty_folders(target_directory)
+        for _ in tqdm(range(1), desc="Cleaning empty folders", unit="folder"):
+            clean_empty_folders(target_directory)
+
 
     print(f"\n🎉 All done! Organized photos are in:\n   {output_directory}")
 
