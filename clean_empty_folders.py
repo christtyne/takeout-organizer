@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 """
 clean_empty_folders.py
@@ -24,31 +22,35 @@ def clean_empty_folders(target_directory: Path) -> None:
         reverse=True
     )
 
+    IGNORABLE = {'.DS_Store', 'metadata.json'}
+
     for directory in all_directories:
         # Prevent deletion of the root directory itself
         if directory == target_directory:
             continue
         try:
-            # List non-DS_Store entries
+            # Ignore .DS_Store and metadata.json when checking for content
             children = [
                 child for child in directory.iterdir()
-                if not (child.is_file() and child.name == '.DS_Store')
+                if not (child.is_file() and child.name in IGNORABLE)
             ]
-            if not children:
-                # Remove .DS_Store if present
-                ds_store_file = directory / '.DS_Store'
 
-                if ds_store_file.exists():
-                    ds_store_file.unlink()
+            if not children:
+                # Remove ignorable files if present
+                for name in IGNORABLE:
+                    file = directory / name
+
+                    if file.exists():
+                        file.unlink()
 
                 # Remove the empty directory
                 directory.rmdir()
                 removed_count += 1
-                print(f"🗑 Removed empty folder: {directory}")
+                print(f"\n🗑 Removed empty folder: {directory}")
 
         except Exception:
             # Skip any directory we cannot remove
             pass
         
     if removed_count == 0:
-        print(f"✅ No empty folders found in {target_directory}")
+        print(f"\n✅ No empty folders found in {target_directory}")
