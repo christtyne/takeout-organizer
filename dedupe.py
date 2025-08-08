@@ -109,10 +109,6 @@ def find_duplicates(connection, root_dir: Path):
     # 2) Compare each file to subsequent ones
     for i, (first, phash1_str, dhash1_str) in enumerate(entries):
         if first in visited:
-            try:
-                update_ssim_score(connection, first, float(sim_score))
-            except Exception as e:
-                logger.error(f"Failed updating SSIM for {first}: {e}")
             continue
         ph1 = int(phash1_str, 16)
         dh1 = int(dhash1_str, 16)
@@ -129,9 +125,11 @@ def find_duplicates(connection, root_dir: Path):
                 if sim_score >= SSIM_THRESHOLD:
                     duplicates.append((first, second, sim_score))
                     try:
+                        # Store SSIM for both participants of the duplicate pair
+                        update_ssim_score(connection, first, float(sim_score))
                         update_ssim_score(connection, second, float(sim_score))
                     except Exception as e:
-                        logger.error(f"Failed updating SSIM for {second}: {e}")
+                        logger.error(f"Failed updating SSIM for {first} / {second}: {e}")
                     visited.add(second)
         visited.add(first)
 
