@@ -13,7 +13,7 @@ based on priority:
 
 import sqlite3
 from datetime import datetime
-from tqdm import tqdm
+from pathlib import Path
 from catalog import update_chosen_date
 
 def choose_timestamp_for_all(connection: sqlite3.Connection) -> None:
@@ -29,7 +29,7 @@ def choose_timestamp_for_all(connection: sqlite3.Connection) -> None:
     """)
     rows = cursor.fetchall()
 
-    for filepath, exif_str, json_str, filename_str in tqdm(rows, desc="Choosing timestamps", unit="file"):
+    for filepath, exif_str, json_str, filename_str in rows:
         # Collect valid datetime objects
         parsed_options = []
         if exif_str:
@@ -57,6 +57,6 @@ def choose_timestamp_for_all(connection: sqlite3.Connection) -> None:
         chosen_string = chosen_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 
         # update the database with the chosen date
-        update_chosen_date(chosen_string, filepath)
+        update_chosen_date(connection, Path(filepath), chosen_string)
 
     connection.commit()
