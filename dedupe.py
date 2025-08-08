@@ -2,8 +2,10 @@
 """
 dedupe.py
 
-Detect and optionally move duplicate or near-duplicate images in a directory
-using perceptual hashes (pHash & dHash) plus SSIM for visual similarity.
+Detect near-duplicate images using perceptual hashes (pHash & dHash) plus SSIM.
+After detection, rename **all** files based on their chosen_date from the DB.
+Unique files get a timestamp filename; duplicates get the same timestamp with
+a `_duplicate` suffix. Renames are recorded in the DB via `renamed_filepath`.
 
 Usage:
   # This module expects an existing SQLite connection and does not open one itself.
@@ -17,6 +19,7 @@ import cv2
 from skimage.metrics import structural_similarity as ssim
 
 import logging
+from catalog import update_renamed_filepath
 
 # Ensure a logs directory exists next to this script
 LOGS_DIR = Path(__file__).parent / "logs"
@@ -124,21 +127,48 @@ def find_duplicates(connection, root_dir: Path):
 
         visited.add(first)
 
-    # 3) Rename
-    for keep, dup, score in duplicates:
-        # Generate a unique duplicate filename in the same folder
-        new_path = make_unique_path(
-            dup.parent,
-            dup.stem + "_duplicate",
-            dup.suffix,
-            original_file_path=dup
-        )
-        try:
-            dup.rename(new_path)
-            logger.info(f"Marked duplicate {dup} → {new_path}")
-            print(f"🔖 Marked duplicate: {new_path}  ← visually matches {keep}  (SSIM={score:.3f})")
-        except Exception as error:
-            logger.error(f"Failed renaming duplicate {dup}: {error}")
-    print(f"\n⚠️  Found and renamed {len(duplicates)} duplicate(s).")
+    # 3) Rename ALL files based on chosen_date, append _duplicate for those flagged
+    # Build a quick lookup of chosen_date strings (already formatted by choose_timestamp.py)
+    cursor.execute("SELECT filepath, chosen_date FROM media")
+    rows = cursor.fetchall()
 
+    # Set of duplicates (paths) determined above
+    duplicate_set = {dup for (_keep, dup, _score) in duplicates}
+
+    renamed_count = 0
+    for filepath_str, chosen_str in rows:
+        file_path = Path(filepath_str)
+        if not file_path.exists():
+            logger.warning(f"File not found on disk, skipping rename: {file_path}")
+            continue
+        if not chosen_str:
+            logger.warning(f"No chosen_date in DB for {file_path}; skipping rename")
+            continue
+
+        # Use the already-formatted timestamp string as base name
+        base_name = chosen_str
+
+        # If this file was marked as duplicate, append suffix
+        if file_path in duplicate_set:
+            base_name = f"{base_name}_duplicate"
+
+        extension = file_path.suffix.lower()
+        new_path = make_unique_path(
+            file_path.parent,
+            base_name,
+            extension,
+            original_file_path=file_path,
+        )
+
+        if new_path != file_path:
+            try:
+                file_path.rename(new_path)
+                # Update DB with renamed path for traceability
+                update_renamed_filepath(connection, file_path, new_path)
+                logger.info(f"Renamed {file_path} → {new_path}")
+                renamed_count += 1
+            except Exception as error:
+                logger.error(f"Failed to rename {file_path}: {error}")
+
+    print(f"\n🔖 Renamed {renamed_count} file(s) (duplicates marked with _duplicate).")
     return duplicates

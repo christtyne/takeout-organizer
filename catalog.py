@@ -33,7 +33,8 @@ def initialize_database(database_path: Path = DATABASE_FILE) -> sqlite3.Connecti
             phash TEXT,
             dhash TEXT,
             ssim_score REAL,
-            chosen_date TEXT
+            chosen_date TEXT,
+            renamed_filepath TEXT
         )
         """
     )
@@ -154,6 +155,18 @@ def update_ssim_score(connection: sqlite3.Connection, media_file_path: Path, sco
     connection.commit()
 
 
+def update_renamed_filepath(connection: sqlite3.Connection, old_file_path: Path, new_file_path: Path) -> None:
+    """
+    Store the new renamed filepath for a given media file.
+    """
+    cursor = connection.cursor()
+    cursor.execute(
+        "UPDATE media SET renamed_filepath = ? WHERE filepath = ?",
+        (str(new_file_path), str(old_file_path))
+    )
+    connection.commit()
+
+
 def fetch_all_media_entries(connection: sqlite3.Connection) -> list[tuple]:
     """
     Return a list of all rows with:
@@ -166,7 +179,8 @@ def fetch_all_media_entries(connection: sqlite3.Connection) -> list[tuple]:
         SELECT filepath, jsonpath, exif_create_date,
                json_taken_date, filename_parsed_date,
                phash, dhash, ssim_score,
-               chosen_date
+               chosen_date,
+               renamed_filepath
         FROM media
         """
     )
