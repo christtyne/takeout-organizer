@@ -72,7 +72,7 @@ def find_media_files(root_directory: Path) -> List[Path]:
     Recursively find all media files under root_directory matching supported extensions.
     """
     media_file_paths: List[Path] = []
-    for candidate in tqdm(root_directory.rglob("*"), desc="Searching media files", unit="file"):
+    for candidate in root_directory.rglob("*"):
         if not candidate.is_file():
             continue
         if candidate.suffix.lower() in MEDIA_EXTENSIONS:
@@ -85,7 +85,7 @@ def find_json_files(root_directory: Path) -> List[Path]:
     Recursively find all JSON sidecar files under root_directory (ending in .json).
     """
     json_file_paths: List[Path] = []
-    for candidate in tqdm(root_directory.rglob("*.json"), desc="Searching JSON files", unit="file"):
+    for candidate in root_directory.rglob("*.json"):
         if candidate.suffix.lower() != ".json":
             continue
         if candidate.name.lower().endswith(tuple(IGNORE_JSON_SUFFIXES)):

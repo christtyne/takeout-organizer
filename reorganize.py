@@ -41,35 +41,33 @@ def reorganize_files(connection: sqlite3.Connection, output_directory: Path) -> 
     organize_by_month = (choice == "2")
 
     cursor = connection.cursor()
-    cursor.execute(
-        """
-        SELECT renamed_filepath, chosen_date
-        FROM media
-        WHERE chosen_date IS NOT NULL
-        """
-    )
+    cursor.execute("SELECT renamed_filepath, chosen_date FROM media WHERE renamed_filepath IS NOT NULL")
     rows = cursor.fetchall()
 
-    for renamed_filepath_str, chosen_date_str in tqdm(rows, desc="Reorganizing files", unit="file"):
+    for renamed_filepath_str, chosen_date_str in rows:
         media_path = Path(renamed_filepath_str)
-        try:
-            timestamp = datetime.fromisoformat(chosen_date_str)
-        except ValueError:
-            # Skip entries with invalid date format
+
+        if not media_path.exists():
+            continue
+        if not chosen_date_str:
             continue
 
-        year = timestamp.strftime("%Y")
-        month = timestamp.strftime("%m")
+        # chosen_str example: "2023-07-14_21-05-09" or "2023-07-14_21-05-09-12"
+        year  = chosen_date_str[0:4]
+        month = chosen_date_str[5:7]
+
         if organize_by_month:
             destination_dir = output_directory / year / month
         else:
             destination_dir = output_directory / year
         destination_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            shutil.move(str(media_path), str(destination_dir))
-            new_filename = destination_dir / media_path
-            # Update database: record that this media's filepath has changed
-            update_renamed_filepath(renamed_filepath_str, new_filename)
-        except Exception as error:
-            logger.error(f"❌ Failed to move {media_path.name}: {error}")
+        new_path = destination_dir / media_path.name
+
+        if new_path != media_path:
+            try:
+                shutil.move(str(media_path), str(new_path))
+                # Update database with the new renamed path (point renamed_filepath to new path)
+                update_renamed_filepath(connection, media_path, new_path)
+            except Exception as error:
+                logger.error(f"❌ Failed to move {media_path.name}: {error}")

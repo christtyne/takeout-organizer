@@ -24,7 +24,7 @@ def clean_empty_folders(target_directory: Path) -> None:
         reverse=True
     )
 
-    for directory in tqdm(all_directories, desc="Cleaning empty folders", unit="folder"):
+    for directory in all_directories:
         # Prevent deletion of the root directory itself
         if directory == target_directory:
             continue

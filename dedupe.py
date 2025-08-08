@@ -19,7 +19,8 @@ import cv2
 from skimage.metrics import structural_similarity as ssim
 
 import logging
-from catalog import update_renamed_filepath
+from catalog import update_renamed_filepath, update_ssim_score
+
 
 # Ensure a logs directory exists next to this script
 LOGS_DIR = Path(__file__).parent / "logs"
@@ -108,6 +109,10 @@ def find_duplicates(connection, root_dir: Path):
     # 2) Compare each file to subsequent ones
     for i, (first, phash1_str, dhash1_str) in enumerate(entries):
         if first in visited:
+            try:
+                update_ssim_score(connection, first, float(sim_score))
+            except Exception as e:
+                logger.error(f"Failed updating SSIM for {first}: {e}")
             continue
         ph1 = int(phash1_str, 16)
         dh1 = int(dhash1_str, 16)
@@ -123,8 +128,11 @@ def find_duplicates(connection, root_dir: Path):
                 sim_score = compute_ssim(first, second)
                 if sim_score >= SSIM_THRESHOLD:
                     duplicates.append((first, second, sim_score))
+                    try:
+                        update_ssim_score(connection, second, float(sim_score))
+                    except Exception as e:
+                        logger.error(f"Failed updating SSIM for {second}: {e}")
                     visited.add(second)
-
         visited.add(first)
 
     # 3) Rename ALL files based on chosen_date, append _duplicate for those flagged
