@@ -10,10 +10,8 @@ Usage:
 """
 
 from pathlib import Path
-import shutil
 
 from PIL import Image
-import numpy as np
 from imagehash import phash, dhash
 import cv2
 from skimage.metrics import structural_similarity as ssim
@@ -51,6 +49,7 @@ def compute_perceptual_hashes(media_file_path: Path) -> tuple[str, str]:
         logger.error(f"Failed computing perceptual hashes for {media_file_path}: {err}")
         return None, None
 
+
 def compute_ssim(path_a: Path, path_b: Path) -> float:
     """Return SSIM score between two images, after resizing to match.
         SSIM ≥ 0.98 ⇒ near-identical pixels (an “edit”)
@@ -68,7 +67,23 @@ def compute_ssim(path_a: Path, path_b: Path) -> float:
     return score
 
 
-def find_duplicates(connection, root_dir: Path, move_to: Path = None):
+def make_unique_path(parent_directory: Path, base_name: str, extension: str, original_file_path: Path = None) -> Path:
+    """
+    Given a base_name and extension, return a unique Path in parent_directory:
+    base_name+extension or base_name(n)+extension if there’s a collision.
+    """
+    candidate = parent_directory / f"{base_name}{extension}"
+    if not candidate.exists() or (original_file_path and candidate.samefile(original_file_path)):
+        return candidate
+    index = 1
+    while True:
+        numbered = parent_directory / f"{base_name}({index}){extension}"
+        if not numbered.exists():
+            return numbered
+        index += 1
+
+
+def find_duplicates(connection, root_dir: Path):
     """
     Scan root_dir for duplicate images using perceptual hashes and file sizes
     stored in the provided SQLite connection's 'media' table.
@@ -109,29 +124,21 @@ def find_duplicates(connection, root_dir: Path, move_to: Path = None):
 
         visited.add(first)
 
-    # 3) Report or move
-    if move_to:
-        move_to.mkdir(parents=True, exist_ok=True)
-        for keep, dup, score in duplicates:
-            # Build new filename with "_duplicate" suffix
-            new_name = f"{dup.stem}_duplicate{dup.suffix}"
-            dest = move_to / new_name
-            try:
-                shutil.move(str(dup), str(dest))
-                logger.info(f"Renamed and moved duplicate {dup} → {dest}")
-            except Exception as error:
-                logger.error(f"Failed to move duplicate {dup}: {error}")
-    else:
-        for keep, dup, score in duplicates:
-            # Rename in place with "_duplicate" suffix
-            new_name = f"{dup.stem}_duplicate{dup.suffix}"
-            new_path = dup.parent / new_name
-            try:
-                dup.rename(new_path)
-                logger.info(f"Marked duplicate {dup} → {new_path}")
-                print(f"🔖 Marked duplicate: {new_path}  ← visually matches {keep}  (SSIM={score:.3f})")
-            except Exception as error:
-                logger.error(f"Failed renaming duplicate {dup}: {error}")
-        print(f"\n⚠️  Found and renamed {len(duplicates)} duplicate(s).")
+    # 3) Rename
+    for keep, dup, score in duplicates:
+        # Generate a unique duplicate filename in the same folder
+        new_path = make_unique_path(
+            dup.parent,
+            dup.stem + "_duplicate",
+            dup.suffix,
+            original_file_path=dup
+        )
+        try:
+            dup.rename(new_path)
+            logger.info(f"Marked duplicate {dup} → {new_path}")
+            print(f"🔖 Marked duplicate: {new_path}  ← visually matches {keep}  (SSIM={score:.3f})")
+        except Exception as error:
+            logger.error(f"Failed renaming duplicate {dup}: {error}")
+    print(f"\n⚠️  Found and renamed {len(duplicates)} duplicate(s).")
 
     return duplicates
