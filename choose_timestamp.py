@@ -14,6 +14,7 @@ based on priority:
 import sqlite3
 from datetime import datetime
 from tqdm import tqdm
+from catalog import update_chosen_date
 
 def choose_timestamp_for_all(connection: sqlite3.Connection) -> None:
     """
@@ -51,14 +52,11 @@ def choose_timestamp_for_all(connection: sqlite3.Connection) -> None:
             # no valid date found; leave chosen_date NULL
             continue
 
-        # choose the oldest (earliest) date
+        # choose the oldest date
         chosen_datetime = min(parsed_options)
-        chosen_string = chosen_datetime.isoformat()
+        chosen_string = chosen_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 
         # update the database with the chosen date
-        cursor.execute(
-            "UPDATE media SET chosen_date = ? WHERE filepath = ?",
-            (chosen_string, filepath)
-        )
+        update_chosen_date(chosen_string, filepath)
 
     connection.commit()
