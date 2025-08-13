@@ -12,6 +12,7 @@ based on priority:
 """
 
 import sqlite3
+from tqdm import tqdm
 from datetime import datetime
 from pathlib import Path
 from catalog import update_chosen_date
@@ -29,22 +30,22 @@ def choose_timestamp_for_all(connection: sqlite3.Connection) -> None:
     """)
     rows = cursor.fetchall()
 
-    for filepath, exif_str, json_str, filename_str in rows:
-        # Collect valid datetime objects
-        parsed_options = []
+    for filepath, exif_str, json_str, filename_str in tqdm(rows, desc="Choosing timestamps", unit="file"):
+        # Collect valid datetime objects with their source
+        parsed_options = []  # list of tuples: (datetime, source)
         if exif_str:
             try:
-                parsed_options.append(datetime.fromisoformat(exif_str))
+                parsed_options.append((datetime.fromisoformat(exif_str), "exif"))
             except ValueError:
                 pass
         if json_str:
             try:
-                parsed_options.append(datetime.fromisoformat(json_str))
+                parsed_options.append((datetime.fromisoformat(json_str), "json"))
             except ValueError:
                 pass
         if filename_str:
             try:
-                parsed_options.append(datetime.fromisoformat(filename_str))
+                parsed_options.append((datetime.fromisoformat(filename_str), "filename"))
             except ValueError:
                 pass
 
@@ -52,8 +53,25 @@ def choose_timestamp_for_all(connection: sqlite3.Connection) -> None:
             # no valid date found; leave chosen_date NULL
             continue
 
-        # choose the oldest date
-        chosen_datetime = min(parsed_options)
+        # choose the oldest date (keep source)
+        chosen_datetime, chosen_source = min(parsed_options, key=lambda x: x[0])
+
+        # Only if the winner came from FILENAME and is exactly midnight,
+        # prefer another timestamp on the same date that has time info.
+        if (
+            chosen_source == "filename" and
+            chosen_datetime.hour == 0 and
+            chosen_datetime.minute == 0 and
+            chosen_datetime.second == 0
+        ):
+            same_date_with_time = [
+                dt for (dt, src) in parsed_options
+                if dt.date() == chosen_datetime.date() and not (
+                    dt.hour == 0 and dt.minute == 0 and dt.second == 0
+                )
+            ]
+            if same_date_with_time:
+                chosen_datetime = min(same_date_with_time)
         chosen_string = chosen_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 
         # update the database with the chosen date
