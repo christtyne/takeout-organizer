@@ -58,12 +58,21 @@ ERROR_JSON_DIR_NAME = "json_error"
 IGNORE_JSON_SUFFIXES = {".db", ".txt", ".md"}
 
 # Regex for parsing dates out of filenames, e.g. IMG_20220101_123456
-
-    #r"^(?P<year>\d{4})[-_.]?(?P<month>\d{2})[-_.]?(?P<day>\d{2})"
-    #r"[_-]?(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})$"
 FILENAME_DATE_PATTERN = re.compile(
-    r"(?P<year>\d{4})[-_.]?(?P<month>\d{2})[-_.]?(?P<day>\d{2})[ _-]?"
-    r"(?P<hour>\d{2})(?:[:.]?)(?P<minute>\d{2})(?:[:.]?)(?P<second>\d{2})"
+    r"""
+    (?P<year>(?:19|20)\d{2})           # 4-digit year starting with 19xx or 20xx
+    [-_.]?                              # optional separator
+    (?P<month>\d{2})                   # 2-digit month
+    [-_.]?                              # optional separator
+    (?P<day>\d{2})                     # 2-digit day
+    (?:                                 # --- optional time portion ---
+        [ T_-]?                         # optional spacer between date and time
+        (?P<hour>\d{2})                # 2-digit hour
+        (?:[:.]?(?P<minute>\d{2}))?    # optional minute with optional sep
+        (?:[:.]?(?P<second>\d{2}))?    # optional second with optional sep
+    )?
+    """,
+    re.VERBOSE,
 )
 
 
@@ -202,21 +211,30 @@ def parse_date_from_filename(filename_stem: str) -> Optional[str]:
     Parse a fallback date from filename patterns like YYYYMMDD_HHMMSS.
     Returns an ISO8601 date string or None.
     """
-    #logger.debug(f"Parsing date from filename stem: {filename_stem}")
+
     match = FILENAME_DATE_PATTERN.search(filename_stem)
     if not match:
         logger.warning(f"No date pattern found in filename: {filename_stem}")
         return None
+    
     parts = match.groupdict()
     try:
-        parsed = datetime(
-            int(parts["year"]), int(parts["month"]), int(parts["day"]),
-            int(parts["hour"]), int(parts["minute"]), int(parts["second"]),
-            tzinfo=timezone.utc
+        year = int(parts["year"])  
+        month = int(parts["month"]) 
+        day = int(parts["day"])    
+
+        hour = int(parts.get("hour") or 0)
+        minute = int(parts.get("minute") or 0)
+        second = int(parts.get("second") or 0)
+
+        parsed_dt = datetime(
+            year, month, day,
+            hour, minute, second,
+            tzinfo=timezone.utc,
         )
-        return parsed.isoformat()
+        return parsed_dt.isoformat()
     except Exception:
-        return None
+        logger.exception(f"Failed to parse date from filename: {filename_stem}")
 
 
 # Detect and correct file extension based on MIME type
