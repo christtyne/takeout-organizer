@@ -1,84 +1,137 @@
 #!/usr/bin/env python3
 """
-dedupe.py
+Deduplicate and rename media files.
 
-Detect near-duplicate images using perceptual hashes (pHash & dHash) plus SSIM.
-After detection, rename **all** files based on their chosen_date from the DB.
-Unique files get a timestamp filename; duplicates get the same timestamp with
-a `_duplicate` suffix. Renames are recorded in the DB via `renamed_filepath`.
+This module identifies visual duplicates using a perceptual-hash prefilter
+(pHash + dHash → Hamming distance) and an SSIM verification step. After
+classification, it renames **all** files to their `chosen_date` (already
+formatted by `choose_timestamp.py`), appending "_duplicate" for files that
+were marked as duplicates. Each rename is recorded in the database via the
+`renamed_filepath` column.
 
-Usage:
-  # This module expects an existing SQLite connection and does not open one itself.
+Best‑practices applied:
+- Strong type hints and cohesive helper functions
+- Explicit constants for thresholds and paths
+- Robust logging with a rotating file handler
+- Clear separation of: loading entries → comparing → renaming
+- Defensive updates to the catalog (SSIM stored for both files)
 """
+from __future__ import annotations
 
-from pathlib import Path
-
-from PIL import Image
-from imagehash import phash, dhash
-import cv2
-from skimage.metrics import structural_similarity as ssim
-
+from dataclasses import dataclass
 import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Set, Tuple
+import sqlite3
+
+import cv2
+from PIL import Image
+from imagehash import dhash, phash
+from skimage.metrics import structural_similarity as ssim
+from tqdm import tqdm
+
 from catalog import update_renamed_filepath, update_ssim_score
 
-
-# Ensure a logs directory exists next to this script
+# ----------------------------------
+# Configuration & logging
+# ----------------------------------
 LOGS_DIR = Path(__file__).parent / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
-# Configure logger
+LOG_FILE = LOGS_DIR / "hash_duplicates.log"
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-log_file = LOGS_DIR / "hash_duplicates.log"
-handler = logging.FileHandler(log_file, encoding="utf-8")
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-logger.addHandler(handler)
+if not logger.handlers:
+    # rotate at ~2MB, keep a couple of backups
+    _fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=2, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_fh)
 
 # Tunable thresholds
-PHASH_THRESHOLD = 3     # hamming distance
-DHASH_THRESHOLD = 3     # hamming distance
-SSIM_THRESHOLD  = 0.95  # SSIM score (0–1)
+PHASH_THRESHOLD: int = 3      # Hamming distance threshold for pHash
+DHASH_THRESHOLD: int = 3      # Hamming distance threshold for dHash
+SSIM_THRESHOLD: float = 0.95  # SSIM threshold (0..1) for duplicates
+
+# Bucket size for pHash prefix to reduce comparisons
+PHASH_BUCKET_PREFIX: int = 4   # compare files only within same leading hex prefix
 
 
-# Perceptual hash utilities
-def compute_perceptual_hashes(media_file_path: Path) -> tuple[str, str]:
-    """
-    Compute perceptual pHash and dHash for the given media file.
-    Returns a tuple (pHash, dHash) as hex strings, or (None, None) on error.
-    """
+# ----------------------------------
+# Data structures
+# ----------------------------------
+@dataclass(frozen=True)
+class HashedEntry:
+    path: Path
+    phash_hex: str
+    dhash_hex: str
+
+
+@dataclass(frozen=True)
+class DuplicateRecord:
+    keep_path: Path
+    duplicate_path: Path
+    score: float  # SSIM score used for decision
+
+
+# ----------------------------------
+# Utilities
+# ----------------------------------
+
+def _hamming_hex(a_hex: str, b_hex: str) -> int:
+    """Return Hamming distance between two same-length hex strings."""
+    try:
+        return (int(a_hex, 16) ^ int(b_hex, 16)).bit_count()
+    except Exception:
+        return 64  # large distance if parsing failed
+
+
+def compute_perceptual_hashes(media_file_path: Path) -> Tuple[str | None, str | None]:
+    """Compute pHash and dHash hex strings for an image path, or (None, None) on error."""
     try:
         image = Image.open(media_file_path).convert("RGB")
         return str(phash(image)), str(dhash(image))
-    except Exception as err:
-        logger.error(f"Failed computing perceptual hashes for {media_file_path}: {err}")
+    except Exception as error:  # pragma: no cover (best-effort logging)
+        logger.error(f"Failed computing perceptual hashes for {media_file_path}: {error}")
         return None, None
 
 
-def compute_ssim(path_a: Path, path_b: Path) -> float:
-    """Return SSIM score between two images, after resizing to match.
-        SSIM ≥ 0.98 ⇒ near-identical pixels (an “edit”)
-	    SSIM < 0.95 ⇒ probably a genuinely different shot    
+def compute_ssim_score(path_a: Path, path_b: Path) -> float:
+    """Compute SSIM between two images after resizing to a common size.
+
+    Returns 0.0 if either image cannot be read. Uses data_range=255 for uint8.
     """
     a = cv2.imread(str(path_a), cv2.IMREAD_GRAYSCALE)
     b = cv2.imread(str(path_b), cv2.IMREAD_GRAYSCALE)
     if a is None or b is None:
         return 0.0
-    # resize both to the same smallest shape
-    height, width = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
-    a_small = cv2.resize(a, (width, height))
-    b_small = cv2.resize(b, (width, height))
-    score, _ = ssim(a_small, b_small, full=True)
-    return score
+    # Resize both to the smaller common dimensions to compare like with like
+    height = min(a.shape[0], b.shape[0])
+    width = min(a.shape[1], b.shape[1])
+    if height <= 0 or width <= 0:
+        return 0.0
+    a_small = cv2.resize(a, (width, height), interpolation=cv2.INTER_AREA)
+    b_small = cv2.resize(b, (width, height), interpolation=cv2.INTER_AREA)
+    try:
+        return float(ssim(a_small, b_small, data_range=255))
+    except Exception:
+        return 0.0
 
 
-def make_unique_path(parent_directory: Path, base_name: str, extension: str, original_file_path: Path = None) -> Path:
-    """
-    Given a base_name and extension, return a unique Path in parent_directory:
-    base_name+extension or base_name(n)+extension if there’s a collision.
+def make_unique_path(parent_directory: Path, base_name: str, extension: str, original_file_path: Path | None = None) -> Path:
+    """Return a unique path `base_name+extension` in `parent_directory`.
+
+    If a collision exists, append `(n)` before the extension. If `candidate` is
+    the same file as `original_file_path`, return the candidate (no-op).
     """
     candidate = parent_directory / f"{base_name}{extension}"
-    if not candidate.exists() or (original_file_path and candidate.samefile(original_file_path)):
-        return candidate
+    try:
+        if not candidate.exists() or (original_file_path and candidate.exists() and candidate.samefile(original_file_path)):
+            return candidate
+    except Exception:
+        if not candidate.exists():
+            return candidate
     index = 1
     while True:
         numbered = parent_directory / f"{base_name}({index}){extension}"
@@ -87,62 +140,91 @@ def make_unique_path(parent_directory: Path, base_name: str, extension: str, ori
         index += 1
 
 
-def find_duplicates(connection, root_dir: Path):
-    """
-    Scan root_dir for duplicate images using perceptual hashes and file sizes
-    stored in the provided SQLite connection's 'media' table.
-    """
-    # 1) Query catalog for files with hashes
+# ----------------------------------
+# Core pipeline steps
+# ----------------------------------
+
+def _load_hashed_entries(connection: sqlite3.Connection) -> List[HashedEntry]:
+    """Load media rows that have both pHash and dHash from the catalog."""
     cursor = connection.cursor()
-    cursor.execute(
-        "SELECT filepath, phash, dhash FROM media WHERE phash IS NOT NULL AND dhash IS NOT NULL"
-    )
-    entries = []
-    for filepath_str, phash_str, dhash_str in cursor.fetchall():
-        file_path = Path(filepath_str)
-        if file_path.exists():
-            entries.append((file_path, phash_str, dhash_str))
+    cursor.execute("SELECT filepath, phash, dhash FROM media WHERE phash IS NOT NULL AND dhash IS NOT NULL")
+    results: List[HashedEntry] = []
+    for filepath_str, phash_hex, dhash_hex in cursor.fetchall():
+        path = Path(filepath_str)
+        if path.exists() and phash_hex and dhash_hex:
+            results.append(HashedEntry(path=path, phash_hex=str(phash_hex), dhash_hex=str(dhash_hex)))
+    return results
 
-    duplicates = []
-    visited = set()
 
-    # 2) Compare each file to subsequent ones
-    for i, (first, phash1_str, dhash1_str) in enumerate(entries):
-        if first in visited:
-            continue
-        ph1 = int(phash1_str, 16)
-        dh1 = int(dhash1_str, 16)
-        for second, phash2_str, dhash2_str in entries[i+1:]:
-            if second in visited:
+def _bucket_by_phash_prefix(entries: Sequence[HashedEntry], prefix_len: int = PHASH_BUCKET_PREFIX) -> Dict[str, List[HashedEntry]]:
+    """Group entries by the first `prefix_len` hex characters of the pHash."""
+    buckets: Dict[str, List[HashedEntry]] = {}
+    for entry in entries:
+        key = entry.phash_hex[:max(0, prefix_len)]
+        buckets.setdefault(key, []).append(entry)
+    return buckets
+
+
+def _find_duplicate_pairs(connection: sqlite3.Connection, entries: Sequence[HashedEntry]) -> List[DuplicateRecord]:
+    """Return a list of DuplicateRecord identified among `entries`.
+
+    Strategy: Within each pHash prefix bucket, compare pairs with small
+    Hamming distance on both pHash and dHash, then verify by SSIM. Record SSIM
+    for both files, regardless of duplicate decision, for later analysis.
+    """
+    duplicates: List[DuplicateRecord] = []
+    visited: Set[Path] = set()
+
+    buckets = _bucket_by_phash_prefix(entries)
+
+    for key, bucket in tqdm(buckets.items(), desc="🔍 Comparing images", unit="bucket"):
+        # local nested loop within bucket
+        for i, left in enumerate(bucket):
+            if left.path in visited:
                 continue
-            ph2 = int(phash2_str, 16)
-            dh2 = int(dhash2_str, 16)
+            for right in bucket[i + 1 : ]:
+                if right.path in visited:
+                    continue
 
-            # 2a) Check Hamming distances
-            if bin(ph1 ^ ph2).count("1") <= PHASH_THRESHOLD and bin(dh1 ^ dh2).count("1") <= DHASH_THRESHOLD:
-                # 2b) Verify with SSIM
-                sim_score = compute_ssim(first, second)
-                if sim_score >= SSIM_THRESHOLD:
-                    duplicates.append((first, second, sim_score))
-                    try:
-                        # Store SSIM for both participants of the duplicate pair
-                        update_ssim_score(connection, first, float(sim_score))
-                        update_ssim_score(connection, second, float(sim_score))
-                    except Exception as e:
-                        logger.error(f"Failed updating SSIM for {first} / {second}: {e}")
-                    visited.add(second)
-        visited.add(first)
+                # Quick gates: Hamming distance thresholds
+                if _hamming_hex(left.phash_hex, right.phash_hex) > PHASH_THRESHOLD:
+                    continue
+                if _hamming_hex(left.dhash_hex, right.dhash_hex) > DHASH_THRESHOLD:
+                    continue
 
-    # 3) Rename ALL files based on chosen_date, append _duplicate for those flagged
-    # Build a quick lookup of chosen_date strings (already formatted by choose_timestamp.py)
+                # Verify: SSIM (store it for both rows)
+                ssim_score = compute_ssim_score(left.path, right.path)
+                logger.debug(f"SSIM {ssim_score:.3f}: {left.path} vs {right.path}")
+                try:
+                    _ = update_ssim_score(connection, left.path, ssim_score)
+                    _ = update_ssim_score(connection, right.path, ssim_score)
+                except Exception as error:  # pragma: no cover
+                    logger.error(f"SSIM DB update failed for {left.path} / {right.path}: {error}")
+
+                if ssim_score >= SSIM_THRESHOLD:
+                    duplicates.append(DuplicateRecord(keep_path=left.path, duplicate_path=right.path, score=ssim_score))
+                    visited.add(right.path)
+            visited.add(left.path)
+
+    return duplicates
+
+
+def _rename_all_by_chosen_date(
+    connection: sqlite3.Connection,
+    duplicates: Sequence[DuplicateRecord],
+) -> int:
+    """Rename all files to `chosen_date` as base name; mark duplicates with `_duplicate`.
+
+    Returns the number of files actually renamed.
+    """
+    cursor = connection.cursor()
     cursor.execute("SELECT filepath, chosen_date FROM media")
-    rows = cursor.fetchall()
+    rows: List[Tuple[str, str | None]] = cursor.fetchall()
 
-    # Set of duplicates (paths) determined above
-    duplicate_set = {dup for (_keep, dup, _score) in duplicates}
+    duplicate_set: Set[Path] = {rec.duplicate_path for rec in duplicates}
 
     renamed_count = 0
-    for filepath_str, chosen_str in rows:
+    for filepath_str, chosen_str in tqdm(rows, desc="✏️ Renaming by chosen_date", unit="file"):
         file_path = Path(filepath_str)
         if not file_path.exists():
             logger.warning(f"File not found on disk, skipping rename: {file_path}")
@@ -151,30 +233,47 @@ def find_duplicates(connection, root_dir: Path):
             logger.warning(f"No chosen_date in DB for {file_path}; skipping rename")
             continue
 
-        # Use the already-formatted timestamp string as base name
         base_name = chosen_str
-
-        # If this file was marked as duplicate, append suffix
         if file_path in duplicate_set:
             base_name = f"{base_name}_duplicate"
 
         extension = file_path.suffix.lower()
-        new_path = make_unique_path(
-            file_path.parent,
-            base_name,
-            extension,
-            original_file_path=file_path,
-        )
+        new_path = make_unique_path(file_path.parent, base_name, extension, original_file_path=file_path)
 
         if new_path != file_path:
             try:
                 file_path.rename(new_path)
-                # Update DB with renamed path for traceability
-                update_renamed_filepath(connection, file_path, new_path)
+                # Keep catalog in sync
+                ok = update_renamed_filepath(connection, file_path, new_path)
+                if not ok:
+                    logger.warning(f"DB row not matched when updating renamed_filepath for: {file_path}")
                 logger.info(f"Renamed {file_path} → {new_path}")
                 renamed_count += 1
-            except Exception as error:
+            except Exception as error:  # pragma: no cover
                 logger.error(f"Failed to rename {file_path}: {error}")
 
-    print(f"\n🔖 Renamed {renamed_count} file(s) (duplicates marked with _duplicate).")
+    return renamed_count
+
+
+# ----------------------------------
+# Public API
+# ----------------------------------
+
+def find_duplicates(connection: sqlite3.Connection, root_dir: Path) -> List[DuplicateRecord]:
+    """End‑to‑end dedupe: gather hashed entries → find matches → rename everything.
+
+    `root_dir` is accepted for API compatibility but not used directly because
+    we rely on the catalog’s file list. The function returns the list of
+    `DuplicateRecord` found.
+    """
+    entries = _load_hashed_entries(connection)
+    if not entries:
+        logger.info("No hashed entries present; nothing to compare.")
+        return []
+
+    duplicates = _find_duplicate_pairs(connection, entries)
+
+    renamed = _rename_all_by_chosen_date(connection, duplicates)
+    print(f"\n🔖 Renamed {renamed} file(s) (duplicates marked with _duplicate).")
+
     return duplicates
