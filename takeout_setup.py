@@ -60,13 +60,13 @@ def main():
     # 4) Discover media files with progress bar
     print("\nScanning for media files...")
     media_iterator = extract_meta.find_media_files(target_directory)
-    media_file_paths = list(tqdm(media_iterator, desc="Finding media files", unit="file"))
+    media_file_paths = list(tqdm(media_iterator, desc="Processing media files", unit="file"))
     print(f"✅ Found {len(media_file_paths)} media files")
 
     # 4b) Discover JSON sidecars with progress bar
     print("\nScanning for JSON sidecars...")
     json_iterator = extract_meta.find_json_files(target_directory)
-    json_file_paths = list(tqdm(json_iterator, desc="Finding JSON files", unit="file"))
+    json_file_paths = list(tqdm(json_iterator, desc="Processing JSON files", unit="file"))
     print(f"✅ Found {len(json_file_paths)} JSON files\n")
 
     # Correct any mismatched extensions in place
@@ -115,10 +115,9 @@ def main():
                 connection, media_file_path, filename_date
             )
 
-    print(f"\n")
 
     # 9) Choose the final timestamp for each entry
-    for _ in tqdm(range(1), desc="Choosing timestamps", unit="step"):
+    for _ in range(1):
         choose_timestamp.choose_timestamp_for_all(connection)
 
     # 10) Compute and store perceptual hashes (pHash & dHash)
@@ -133,18 +132,18 @@ def main():
 
     # 11) Deduplication pass
     print("\n🔍 Running dedupe pass and renaming duplicates in place")
-    for _ in tqdm(range(1), desc="\nAnalising files for duplicates", unit="step"):
+    for _ in range(1):
         dedupe.find_duplicates(connection, output_directory)
 
     print(f"\n")
-    
+
     # 12) Move files based on the chosen timestamp
-    for _ in tqdm(range(1), desc="\nReorganizing files", unit="file"):
+    for _ in range(1):
         reorganize.reorganize_files(connection, output_directory)
 
     # 13) Optional cleanup of empty folders
     if input("\n🧹 Remove empty folders? [y/N] ").strip().lower().startswith("y"):
-        for _ in tqdm(range(1), desc="Cleaning empty folders", unit="folder"):
+        for _ in range(1):
             clean_empty_folders(target_directory)
 
 
