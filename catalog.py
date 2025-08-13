@@ -2,186 +2,241 @@
 """
 catalog.py
 
-Manages the media catalog database for the Takeout Organizer pipeline,
-storing paths and timestamps from JSON, EXIF, filename parsing, and
-the final chosen datetime.
+Manage the media catalog database for the Takeout Organizer pipeline.
+This module centralizes all DB I/O and enforces a stable schema.
+
+Key improvements over previous revisions:
+- Robust schema management via ensure_schema(): adds any missing columns.
+- Consistent type hints and boolean return values for update helpers.
+- Robust path-based updates that match by filepath OR renamed_filepath.
+- Idempotent SSIM updates that preserve the maximum score seen.
 """
+from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import List, Tuple, Optional
 
 # Default database file name (in your working directory)
 DATABASE_FILE = Path("media_catalog.db")
 
+# --- Schema definition ---
+TABLE_NAME = "media"
+
+# Column names (use constants to avoid typos)
+COL_ID = "id"
+COL_FILEPATH = "filepath"
+COL_JSONPATH = "jsonpath"
+COL_EXIF_CREATE = "exif_create_date"
+COL_JSON_TAKEN = "json_taken_date"
+COL_FILENAME_PARSED = "filename_parsed_date"
+COL_PHASH = "phash"
+COL_DHASH = "dhash"
+COL_SSIM = "ssim_score"
+COL_CHOSEN = "chosen_date"
+COL_RENAMED = "renamed_filepath"
+
+# Required columns and SQLite types
+REQUIRED_COLUMNS = {
+    COL_FILEPATH: "TEXT UNIQUE NOT NULL",
+    COL_JSONPATH: "TEXT",
+    COL_EXIF_CREATE: "TEXT",
+    COL_JSON_TAKEN: "TEXT",
+    COL_FILENAME_PARSED: "TEXT",
+    COL_PHASH: "TEXT",
+    COL_DHASH: "TEXT",
+    COL_SSIM: "REAL",
+    COL_CHOSEN: "TEXT",
+    COL_RENAMED: "TEXT",
+}
+
 
 def initialize_database(database_path: Path = DATABASE_FILE) -> sqlite3.Connection:
-    """
-    Create (if needed) and open the SQLite database.
-    Returns a Connection object.
-    """
+    """Open (and create if needed) the SQLite database, ensure schema, return connection."""
     connection = sqlite3.connect(str(database_path))
-    cursor = connection.cursor()
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS media (
-            id INTEGER PRIMARY KEY,
-            filepath TEXT UNIQUE NOT NULL,
-            jsonpath TEXT,
-            exif_create_date TEXT,
-            json_taken_date TEXT,
-            filename_parsed_date TEXT,
-            phash TEXT,
-            dhash TEXT,
-            ssim_score REAL,
-            chosen_date TEXT,
-            renamed_filepath TEXT
-        )
-        """
-    )
-    connection.commit()
+    ensure_schema(connection)
     return connection
 
 
-def add_media_entry(connection: sqlite3.Connection, media_file_path: Path) -> None:
+def ensure_schema(connection: sqlite3.Connection) -> None:
+    """Ensure the `media` table exists and contains all required columns.
+
+    This function is safe to call repeatedly; it will add any missing columns
+    without damaging existing data.
     """
-    Ensure there is a row for this media file (no-op if it already exists).
-    """
-    cursor = connection.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO media (filepath) VALUES (?)",
-        (str(media_file_path),)
+    cur = connection.cursor()
+
+    # Create table if missing with minimal shape
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+            {COL_ID} INTEGER PRIMARY KEY,
+            {COL_FILEPATH} TEXT UNIQUE NOT NULL
+        )
+        """
     )
+
+    # Discover existing columns
+    cur.execute(f"PRAGMA table_info({TABLE_NAME})")
+    existing = {row[1] for row in cur.fetchall()}  # column names
+
+    # Add any missing columns
+    for col_name, col_decl in REQUIRED_COLUMNS.items():
+        if col_name not in existing:
+            cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN {col_name} {col_decl}")
+
     connection.commit()
 
 
-def update_json_path(connection: sqlite3.Connection, media_file_path: Path, json_file_path: Path) -> None:
-    """
-    Record the side-car JSON path for a given media file.
-    """
-    cursor = connection.cursor()
-    cursor.execute(
-        "UPDATE media SET jsonpath = ? WHERE filepath = ?",
-        (str(json_file_path), str(media_file_path))
+# --- Row creation ---
+
+def add_media_entry(connection: sqlite3.Connection, media_file_path: Path) -> bool:
+    """Ensure there is a row for this media file. Returns True if inserted."""
+    cur = connection.cursor()
+    cur.execute(
+        f"INSERT OR IGNORE INTO {TABLE_NAME} ({COL_FILEPATH}) VALUES (?)",
+        (str(media_file_path),),
     )
     connection.commit()
+    return cur.rowcount > 0
 
 
-def update_exif_create_date(connection: sqlite3.Connection, media_file_path: Path, create_date: str) -> None:
-    """
-    Store the EXIF CreateDate (the camera’s recorded timestamp).
-    """
-    cursor = connection.cursor()
-    cursor.execute(
-        "UPDATE media SET exif_create_date = ? WHERE filepath = ?",
-        (create_date, str(media_file_path))
+# --- Field update helpers ---
+
+def update_json_path(connection: sqlite3.Connection, media_file_path: Path, json_file_path: Path) -> bool:
+    """Record the sidecar JSON path for a given media file."""
+    cur = connection.cursor()
+    cur.execute(
+        f"UPDATE {TABLE_NAME} SET {COL_JSONPATH} = ? WHERE {COL_FILEPATH} = ?",
+        (str(json_file_path), str(media_file_path)),
     )
     connection.commit()
+    return cur.rowcount > 0
 
 
-def update_json_taken_date(connection: sqlite3.Connection, media_file_path: Path, json_taken_date: str) -> None:
-    """
-    Store the Google JSON photoTakenTime timestamp.
-    """
-    cursor = connection.cursor()
-    cursor.execute(
-        "UPDATE media SET json_taken_date = ? WHERE filepath = ?",
-        (json_taken_date, str(media_file_path))
+def update_exif_create_date(connection: sqlite3.Connection, media_file_path: Path, create_date: str) -> bool:
+    """Store the EXIF CreateDate (camera’s recorded timestamp)."""
+    cur = connection.cursor()
+    cur.execute(
+        f"UPDATE {TABLE_NAME} SET {COL_EXIF_CREATE} = ? WHERE {COL_FILEPATH} = ?",
+        (create_date, str(media_file_path)),
     )
     connection.commit()
+    return cur.rowcount > 0
+
+
+def update_json_taken_date(connection: sqlite3.Connection, media_file_path: Path, json_taken_date: str) -> bool:
+    """Store the Google JSON photoTakenTime timestamp."""
+    cur = connection.cursor()
+    cur.execute(
+        f"UPDATE {TABLE_NAME} SET {COL_JSON_TAKEN} = ? WHERE {COL_FILEPATH} = ?",
+        (json_taken_date, str(media_file_path)),
+    )
+    connection.commit()
+    return cur.rowcount > 0
 
 
 def update_filename_parsed_date(
     connection: sqlite3.Connection,
     media_file_path: Path,
-    parsed_date: str
-) -> None:
-    """
-    Store the fallback date parsed from the filename.
-    """
-    cursor = connection.cursor()
-    cursor.execute(
-        "UPDATE media SET filename_parsed_date = ? WHERE filepath = ?",
-        (parsed_date, str(media_file_path))
+    parsed_date: str,
+) -> bool:
+    """Store the fallback date parsed from the filename."""
+    cur = connection.cursor()
+    cur.execute(
+        f"UPDATE {TABLE_NAME} SET {COL_FILENAME_PARSED} = ? WHERE {COL_FILEPATH} = ?",
+        (parsed_date, str(media_file_path)),
     )
     connection.commit()
+    return cur.rowcount > 0
 
 
-def update_chosen_date(connection: sqlite3.Connection, media_file_path: Path, chosen_date: str) -> None:
-    """
-    Record the final chosen UTC date for this file.
-    """
-    cursor = connection.cursor()
-    cursor.execute(
-        "UPDATE media SET chosen_date = ? WHERE filepath = ?",
-        (chosen_date, str(media_file_path))
+def update_chosen_date(connection: sqlite3.Connection, media_file_path: Path, chosen_date: str) -> bool:
+    """Record the final chosen date string for this file (already formatted)."""
+    cur = connection.cursor()
+    cur.execute(
+        f"UPDATE {TABLE_NAME} SET {COL_CHOSEN} = ? WHERE {COL_FILEPATH} = ?",
+        (chosen_date, str(media_file_path)),
     )
     connection.commit()
+    return cur.rowcount > 0
 
 
 # --- Perceptual hash and SSIM update helpers ---
-def update_phash(connection: sqlite3.Connection, media_file_path: Path, perceptual_hash: str) -> None:
-    """
-    Store the perceptual pHash for a given media file.
-    """
-    cursor = connection.cursor()
-    cursor.execute(
-        "UPDATE media SET phash = ? WHERE filepath = ?",
-        (perceptual_hash, str(media_file_path))
+
+def update_phash(connection: sqlite3.Connection, media_file_path: Path, perceptual_hash: str) -> bool:
+    """Store the perceptual pHash for a given media file."""
+    cur = connection.cursor()
+    cur.execute(
+        f"UPDATE {TABLE_NAME} SET {COL_PHASH} = ? WHERE {COL_FILEPATH} = ?",
+        (perceptual_hash, str(media_file_path)),
     )
     connection.commit()
+    return cur.rowcount > 0
 
 
-def update_dhash(connection: sqlite3.Connection, media_file_path: Path, difference_hash: str) -> None:
-    """
-    Store the perceptual dHash for a given media file.
-    """
-    cursor = connection.cursor()
-    cursor.execute(
-        "UPDATE media SET dhash = ? WHERE filepath = ?",
-        (difference_hash, str(media_file_path))
+def update_dhash(connection: sqlite3.Connection, media_file_path: Path, difference_hash: str) -> bool:
+    """Store the perceptual dHash for a given media file."""
+    cur = connection.cursor()
+    cur.execute(
+        f"UPDATE {TABLE_NAME} SET {COL_DHASH} = ? WHERE {COL_FILEPATH} = ?",
+        (difference_hash, str(media_file_path)),
     )
     connection.commit()
+    return cur.rowcount > 0
 
 
-def update_ssim_score(connection: sqlite3.Connection, media_file_path: Path, score: float) -> None:
+def update_ssim_score(connection: sqlite3.Connection, media_file_path: Path, score: float) -> bool:
+    """Store SSIM for a given file, preserving the maximum score seen.
+
+    - Casts to built-in float to avoid numpy types.
+    - Matches by current filepath OR renamed_filepath.
+    Returns True if a row was updated.
     """
-    Store the SSIM similarity score for a given media file.
-    """
-    cursor = connection.cursor()
-    cursor.execute(
-        "UPDATE media SET ssim_score = ? WHERE filepath = ?",
-        (score, str(media_file_path))
+    cur = connection.cursor()
+    val = float(score)
+    cur.execute(
+        f"""
+        UPDATE {TABLE_NAME}
+        SET {COL_SSIM} = CASE
+            WHEN {COL_SSIM} IS NULL OR ? > {COL_SSIM} THEN ?
+            ELSE {COL_SSIM}
+        END
+        WHERE {COL_FILEPATH} = ? OR {COL_RENAMED} = ?
+        """,
+        (val, val, str(media_file_path), str(media_file_path)),
     )
     connection.commit()
+    return cur.rowcount > 0
 
 
-def update_renamed_filepath(connection: sqlite3.Connection, old_file_path: Path, new_file_path: Path) -> None:
-    """
-    Store the new renamed filepath for a given media file.
-    """
-    cursor = connection.cursor()
-    cursor.execute(
-        "UPDATE media SET renamed_filepath = ? WHERE filepath = ?",
-        (str(new_file_path), str(old_file_path))
+def update_renamed_filepath(connection: sqlite3.Connection, old_file_path: Path, new_file_path: Path) -> bool:
+    """Update renamed_filepath to `new_file_path` matching by either filepath or renamed_filepath."""
+    cur = connection.cursor()
+    cur.execute(
+        f"""
+        UPDATE {TABLE_NAME}
+        SET {COL_RENAMED} = ?
+        WHERE {COL_FILEPATH} = ? OR {COL_RENAMED} = ?
+        """,
+        (str(new_file_path), str(old_file_path), str(old_file_path)),
     )
     connection.commit()
+    return cur.rowcount > 0
 
 
-def fetch_all_media_entries(connection: sqlite3.Connection) -> list[tuple]:
-    """
-    Return a list of all rows with:
-    (filepath, jsonpath, exif_create_date, json_taken_date,
-     filename_parsed_date, chosen_date)
-    """
-    cursor = connection.cursor()
-    cursor.execute(
+# --- Queries ---
+
+def fetch_all_media_entries(connection: sqlite3.Connection) -> List[Tuple[str, ...]]:
+    """Return all media rows with commonly used fields."""
+    cur = connection.cursor()
+    cur.execute(
+        f"""
+        SELECT {COL_FILEPATH}, {COL_JSONPATH}, {COL_EXIF_CREATE},
+               {COL_JSON_TAKEN}, {COL_FILENAME_PARSED},
+               {COL_PHASH}, {COL_DHASH}, {COL_SSIM},
+               {COL_CHOSEN}, {COL_RENAMED}
+        FROM {TABLE_NAME}
         """
-        SELECT filepath, jsonpath, exif_create_date,
-               json_taken_date, filename_parsed_date,
-               phash, dhash, ssim_score,
-               chosen_date,
-               renamed_filepath
-        FROM media
-        """
     )
-    return cursor.fetchall()
+    return cur.fetchall()

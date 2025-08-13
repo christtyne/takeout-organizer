@@ -44,7 +44,7 @@ def reorganize_files(connection: sqlite3.Connection, output_directory: Path) -> 
     cursor.execute("SELECT renamed_filepath, chosen_date FROM media WHERE renamed_filepath IS NOT NULL")
     rows = cursor.fetchall()
 
-    for renamed_filepath_str, chosen_date_str in rows:
+    for renamed_filepath_str, chosen_date_str in tqdm(rows, desc="Reorganizing files...", unit="file"):
         media_path = Path(renamed_filepath_str)
 
         if not media_path.exists():
@@ -68,6 +68,11 @@ def reorganize_files(connection: sqlite3.Connection, output_directory: Path) -> 
             try:
                 shutil.move(str(media_path), str(new_path))
                 # Update database with the new renamed path (point renamed_filepath to new path)
-                update_renamed_filepath(connection, media_path, new_path)
+                print(media_path)
+                print("\n")
+                print(new_path)
+                ok = update_renamed_filepath(connection, media_path, new_path)
+                if not ok:
+                    logger.warning(f"⚠️  DB row not matched when updating renamed_filepath for: {media_path}")
             except Exception as error:
                 logger.error(f"❌ Failed to move {media_path.name}: {error}")
