@@ -24,7 +24,7 @@ def clean_empty_folders(target_directory: Path) -> None:
 
     IGNORABLE = {'.DS_Store', 'metadata.json'}
 
-    for directory in all_directories:
+    for directory in tqdm(all_directories, desc="Cleaning empty folders", unit="folder"):
         # Prevent deletion of the root directory itself
         if directory == target_directory:
             continue
@@ -46,11 +46,12 @@ def clean_empty_folders(target_directory: Path) -> None:
                 # Remove the empty directory
                 directory.rmdir()
                 removed_count += 1
-                print(f"\n🗑 Removed empty folder: {directory}")
 
         except Exception:
             # Skip any directory we cannot remove
             pass
-        
+    
     if removed_count == 0:
         print(f"\n✅ No empty folders found in {target_directory}")
+
+    print(f"\n🗑 Removed {removed_count} empty folders")
