@@ -29,12 +29,14 @@ from typing import Dict, List, Sequence, Set, Tuple
 import sqlite3
 
 import cv2
-from PIL import Image
-from imagehash import dhash, phash
+from PIL import Image, ImageOps
+from imagehash import dhash, phash, whash
 from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 
 from catalog import update_renamed_filepath, update_ssim_score
+from videohash import VideoHash
+
 
 # ----------------------------------
 # Configuration & logging
@@ -60,8 +62,10 @@ SSIM_THRESHOLD: float = 0.95  # SSIM threshold (0..1) for duplicates
 # Tunable thresholds (videos)
 VIDEO_HASH_THRESHOLD: int = 10  # Hamming distance threshold for videohash duplicates
 
-# Bucket size for pHash prefix to reduce comparisons
-PHASH_BUCKET_PREFIX: int = 4   # compare files only within same leading hex prefix
+# A softer near-miss window that still triggers SSIM verification
+NEAR_MISS_THRESHOLD: int = 8    # if any hash distance <= 8, we still verify via SSIM
+# Wavelet-hash tolerance helps when compression/contrast changes make pHash/dHash diverge
+WHASH_THRESHOLD: int = 6
 
 
 # ----------------------------------
@@ -94,13 +98,36 @@ def _hamming_hex(a_hex: str, b_hex: str) -> int:
 
 
 def compute_perceptual_hashes(media_file_path: Path) -> Tuple[str | None, str | None]:
-    """Compute pHash and dHash hex strings for an image path, or (None, None) on error."""
+    """Compute pHash and dHash hex strings for an image path, or (None, None) on error.
+
+    Uses EXIF-based auto-orientation to avoid false negatives.
+    """
     try:
-        image = Image.open(media_file_path).convert("RGB")
+        image = Image.open(media_file_path)
+        image = ImageOps.exif_transpose(image).convert("RGB")
         return str(phash(image)), str(dhash(image))
     except Exception as error:  # pragma: no cover (best-effort logging)
         logger.error(f"Failed computing perceptual hashes for {media_file_path}: {error}")
         return None, None
+
+
+def _compute_whash_hex(media_file_path: Path) -> str | None:
+    try:
+        image = Image.open(media_file_path)
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        return str(whash(image))
+    except Exception:
+        return None
+
+
+def compute_video_hash(video_path: Path) -> str | None:
+    """Compute a perceptual video hash using the videohash library."""
+    try:
+        vh = VideoHash(path=str(video_path))
+        return str(vh.hash)
+    except Exception as error:  # pragma: no cover
+        logger.error(f"Failed computing video hash for {video_path}: {error}")
+        return None
 
 
 def compute_ssim_score(path_a: Path, path_b: Path) -> float:
@@ -192,11 +219,23 @@ def _find_duplicate_pairs(connection: sqlite3.Connection, entries: Sequence[Hash
                 if right.path in visited:
                     continue
 
-                # Quick gates: Hamming distance thresholds
-                if _hamming_hex(left.phash_hex, right.phash_hex) > PHASH_THRESHOLD:
+                # --- Quick/soft gates: compute distances once ---
+                d_ph = _hamming_hex(left.phash_hex, right.phash_hex)
+                d_dh = _hamming_hex(left.dhash_hex, right.dhash_hex)
+
+                strict_pass = (d_ph <= PHASH_THRESHOLD and d_dh <= DHASH_THRESHOLD)
+                near_miss = (min(d_ph, d_dh) <= NEAR_MISS_THRESHOLD)
+
+                if not (strict_pass or near_miss):
                     continue
-                if _hamming_hex(left.dhash_hex, right.dhash_hex) > DHASH_THRESHOLD:
-                    continue
+
+                # If strict didn't pass, use wavelet-hash as a robustness cue
+                if not strict_pass and near_miss:
+                    w1 = _compute_whash_hex(left.path)
+                    w2 = _compute_whash_hex(right.path)
+                    if not (w1 and w2) or _hamming_hex(w1, w2) > WHASH_THRESHOLD:
+                        # wHash says they are far apart → skip
+                        continue
 
                 # Verify: SSIM (store it for both rows)
                 ssim_score = compute_ssim_score(left.path, right.path)
@@ -256,6 +295,50 @@ def _find_duplicate_videos(connection: sqlite3.Connection) -> List[DuplicateReco
                     visited.add(b_path)
             visited.add(a_path)
 
+    return duplicates
+
+
+def _find_duplicates_same_chosen_date(connection: sqlite3.Connection) -> List[DuplicateRecord]:
+    """Within each chosen_date group, verify pairs by SSIM.
+
+    This catches cases where hashing differs due to recompression/processing,
+    but the timestamp base name collides.
+    """
+    cursor = connection.cursor()
+    cursor.execute("SELECT filepath, chosen_date FROM media WHERE chosen_date IS NOT NULL")
+    rows = cursor.fetchall()
+
+    # Build groups by chosen_date
+    groups: Dict[str, List[Path]] = {}
+    for fp_str, chosen in rows:
+        p = Path(fp_str)
+        if p.exists() and chosen:
+            groups.setdefault(chosen, []).append(p)
+
+    duplicates: List[DuplicateRecord] = []
+    seen_pairs: Set[frozenset[Path]] = set()
+
+    for _, paths in groups.items():
+        if len(paths) < 2:
+            continue
+        # pairwise SSIM check within the group
+        for i in range(len(paths)):
+            for j in range(i + 1, len(paths)):
+                a, b = paths[i], paths[j]
+                key = frozenset((a, b))
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+
+                ssim_score = compute_ssim_score(a, b)
+                try:
+                    _ = update_ssim_score(connection, a, ssim_score)
+                    _ = update_ssim_score(connection, b, ssim_score)
+                except Exception:
+                    pass
+
+                if ssim_score >= SSIM_THRESHOLD:
+                    duplicates.append(DuplicateRecord(keep_path=a, duplicate_path=b, score=ssim_score))
     return duplicates
 
 
@@ -329,8 +412,11 @@ def find_duplicates(connection: sqlite3.Connection, root_dir: Path) -> List[Dupl
     # Video duplicates (based on videohash)
     video_duplicates = _find_duplicate_videos(connection)
 
-    # Merge both
-    all_duplicates = [*image_duplicates, *video_duplicates]
+    # Duplicates from identical chosen_date groups (SSIM‑verified)
+    date_group_duplicates = _find_duplicates_same_chosen_date(connection)
+
+    # Merge all sources
+    all_duplicates = [*image_duplicates, *video_duplicates, *date_group_duplicates]
 
     renamed = _rename_all_by_chosen_date(connection, all_duplicates)
     print(f"\n🔖 Renamed {renamed} file(s) (duplicates marked with _duplicate).")
