@@ -32,6 +32,7 @@ COL_JSON_TAKEN = "json_taken_date"
 COL_FILENAME_PARSED = "filename_parsed_date"
 COL_PHASH = "phash"
 COL_DHASH = "dhash"
+COL_VIDEO_HASH = "video_hash"
 COL_SSIM = "ssim_score"
 COL_CHOSEN = "chosen_date"
 COL_RENAMED = "renamed_filepath"
@@ -45,6 +46,7 @@ REQUIRED_COLUMNS = {
     COL_FILENAME_PARSED: "TEXT",
     COL_PHASH: "TEXT",
     COL_DHASH: "TEXT",
+    COL_VIDEO_HASH: "TEXT",
     COL_SSIM: "REAL",
     COL_CHOSEN: "TEXT",
     COL_RENAMED: "TEXT",
@@ -186,6 +188,17 @@ def update_dhash(connection: sqlite3.Connection, media_file_path: Path, differen
     return cur.rowcount > 0
 
 
+def update_video_hash(connection: sqlite3.Connection, media_file_path: Path, video_hash: str) -> bool:
+    """Store the perceptual video hash for a given media file."""
+    cur = connection.cursor()
+    cur.execute(
+        f"UPDATE {TABLE_NAME} SET {COL_VIDEO_HASH} = ? WHERE {COL_FILEPATH} = ?",
+        (video_hash, str(media_file_path)),
+    )
+    connection.commit()
+    return cur.rowcount > 0
+
+
 def update_ssim_score(connection: sqlite3.Connection, media_file_path: Path, score: float) -> bool:
     """Store SSIM for a given file, preserving the maximum score seen.
 
@@ -234,7 +247,7 @@ def fetch_all_media_entries(connection: sqlite3.Connection) -> List[Tuple[str, .
         f"""
         SELECT {COL_FILEPATH}, {COL_JSONPATH}, {COL_EXIF_CREATE},
                {COL_JSON_TAKEN}, {COL_FILENAME_PARSED},
-               {COL_PHASH}, {COL_DHASH}, {COL_SSIM},
+               {COL_PHASH}, {COL_DHASH}, {COL_VIDEO_HASH}, {COL_SSIM},
                {COL_CHOSEN}, {COL_RENAMED}
         FROM {TABLE_NAME}
         """
