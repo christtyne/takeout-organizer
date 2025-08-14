@@ -3,8 +3,11 @@
 Deduplicate and rename media files.
 
 This module identifies visual duplicates using a perceptual-hash prefilter
-(pHash + dHash → Hamming distance) and an SSIM verification step. After
-classification, it renames **all** files to their `chosen_date` (already
+(pHash + dHash → Hamming distance) and an SSIM verification step for images.
+For videos, it relies on a perceptual **videohash** (computed earlier in the
+pipeline) and flags near-duplicates by Hamming distance.
+
+After classification, it renames **all** files to their `chosen_date` (already
 formatted by `choose_timestamp.py`), appending "_duplicate" for files that
 were marked as duplicates. Each rename is recorded in the database via the
 `renamed_filepath` column.
@@ -14,7 +17,7 @@ Best‑practices applied:
 - Explicit constants for thresholds and paths
 - Robust logging with a rotating file handler
 - Clear separation of: loading entries → comparing → renaming
-- Defensive updates to the catalog (SSIM stored for both files)
+- Defensive updates to the catalog (SSIM stored for both image files)
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ from dataclasses import dataclass
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Dict, List, Sequence, Set, Tuple
 import sqlite3
 
 import cv2
@@ -49,10 +52,13 @@ if not logger.handlers:
     _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(_fh)
 
-# Tunable thresholds
+# Tunable thresholds (images)
 PHASH_THRESHOLD: int = 3      # Hamming distance threshold for pHash
 DHASH_THRESHOLD: int = 3      # Hamming distance threshold for dHash
 SSIM_THRESHOLD: float = 0.95  # SSIM threshold (0..1) for duplicates
+
+# Tunable thresholds (videos)
+VIDEO_HASH_THRESHOLD: int = 10  # Hamming distance threshold for videohash duplicates
 
 # Bucket size for pHash prefix to reduce comparisons
 PHASH_BUCKET_PREFIX: int = 4   # compare files only within same leading hex prefix
@@ -72,7 +78,7 @@ class HashedEntry:
 class DuplicateRecord:
     keep_path: Path
     duplicate_path: Path
-    score: float  # SSIM score used for decision
+    score: float  # SSIM (images) or 1.0 for video hash decision
 
 
 # ----------------------------------
@@ -141,7 +147,7 @@ def make_unique_path(parent_directory: Path, base_name: str, extension: str, ori
 
 
 # ----------------------------------
-# Core pipeline steps
+# Core pipeline steps (images)
 # ----------------------------------
 
 def _load_hashed_entries(connection: sqlite3.Connection) -> List[HashedEntry]:
@@ -166,7 +172,7 @@ def _bucket_by_phash_prefix(entries: Sequence[HashedEntry], prefix_len: int = PH
 
 
 def _find_duplicate_pairs(connection: sqlite3.Connection, entries: Sequence[HashedEntry]) -> List[DuplicateRecord]:
-    """Return a list of DuplicateRecord identified among `entries`.
+    """Return a list of DuplicateRecord identified among `entries` (images only).
 
     Strategy: Within each pHash prefix bucket, compare pairs with small
     Hamming distance on both pHash and dHash, then verify by SSIM. Record SSIM
@@ -177,7 +183,7 @@ def _find_duplicate_pairs(connection: sqlite3.Connection, entries: Sequence[Hash
 
     buckets = _bucket_by_phash_prefix(entries)
 
-    for key, bucket in tqdm(buckets.items(), desc="🔍 Comparing images", unit="bucket"):
+    for _key, bucket in tqdm(buckets.items(), desc="🔍 Comparing images", unit="bucket"):
         # local nested loop within bucket
         for i, left in enumerate(bucket):
             if left.path in visited:
@@ -208,6 +214,54 @@ def _find_duplicate_pairs(connection: sqlite3.Connection, entries: Sequence[Hash
 
     return duplicates
 
+
+# ----------------------------------
+# Core pipeline steps (videos)
+# ----------------------------------
+
+def _load_video_hash_entries(connection: sqlite3.Connection) -> List[Tuple[Path, str]]:
+    """Load rows that have a video_hash set and still exist on disk."""
+    cursor = connection.cursor()
+    cursor.execute("SELECT filepath, video_hash FROM media WHERE video_hash IS NOT NULL")
+    items: List[Tuple[Path, str]] = []
+    for fp_str, vhash in cursor.fetchall():
+        p = Path(fp_str)
+        if p.exists() and vhash:
+            items.append((p, str(vhash)))
+    return items
+
+
+def _find_duplicate_videos(connection: sqlite3.Connection) -> List[DuplicateRecord]:
+    """Identify duplicate videos using videohash Hamming distance only."""
+    pairs = _load_video_hash_entries(connection)
+    if not pairs:
+        return []
+
+    # bucket videos by prefix to reduce comparisons
+    buckets: Dict[str, List[Tuple[Path, str]]] = {}
+    for p, h in pairs:
+        buckets.setdefault(h[:4], []).append((p, h))
+
+    duplicates: List[DuplicateRecord] = []
+    visited: Set[Path] = set()
+    for _key, bucket in tqdm(buckets.items(), desc="🎞️ Comparing videos", unit="bucket"):
+        for i, (a_path, a_hash) in enumerate(bucket):
+            if a_path in visited:
+                continue
+            for b_path, b_hash in bucket[i+1:]:
+                if b_path in visited:
+                    continue
+                if _hamming_hex(a_hash, b_hash) <= VIDEO_HASH_THRESHOLD:
+                    duplicates.append(DuplicateRecord(keep_path=a_path, duplicate_path=b_path, score=1.0))
+                    visited.add(b_path)
+            visited.add(a_path)
+
+    return duplicates
+
+
+# ----------------------------------
+# Renaming
+# ----------------------------------
 
 def _rename_all_by_chosen_date(
     connection: sqlite3.Connection,
@@ -266,14 +320,19 @@ def find_duplicates(connection: sqlite3.Connection, root_dir: Path) -> List[Dupl
     we rely on the catalog’s file list. The function returns the list of
     `DuplicateRecord` found.
     """
-    entries = _load_hashed_entries(connection)
-    if not entries:
-        logger.info("No hashed entries present; nothing to compare.")
-        return []
+    # Image duplicates
+    image_entries = _load_hashed_entries(connection)
+    if not image_entries:
+        logger.info("No hashed image entries present; continuing with videos only.")
+    image_duplicates = _find_duplicate_pairs(connection, image_entries) if image_entries else []
 
-    duplicates = _find_duplicate_pairs(connection, entries)
+    # Video duplicates (based on videohash)
+    video_duplicates = _find_duplicate_videos(connection)
 
-    renamed = _rename_all_by_chosen_date(connection, duplicates)
+    # Merge both
+    all_duplicates = [*image_duplicates, *video_duplicates]
+
+    renamed = _rename_all_by_chosen_date(connection, all_duplicates)
     print(f"\n🔖 Renamed {renamed} file(s) (duplicates marked with _duplicate).")
 
-    return duplicates
+    return all_duplicates
