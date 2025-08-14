@@ -67,9 +67,13 @@ FILENAME_DATE_PATTERN = re.compile(
     (?P<day>\d{2})                     # 2-digit day
     (?:                                 # --- optional time portion ---
         [ T_-]?                         # optional spacer between date and time
-        (?P<hour>\d{2})                # 2-digit hour
-        (?:[:.]?(?P<minute>\d{2}))?    # optional minute with optional sep
-        (?:[:.]?(?P<second>\d{2}))?    # optional second with optional sep
+        (?:
+            # Separated form requires at least HH:MM
+            (?P<hour_sep>\d{2})(?:(?::|\.)(?P<minute_sep>\d{2})(?:(?::|\.)(?P<second_sep>\d{2}))?)
+            |
+            # Compact form must be HHMM or HHMMSS (not 2 or 3 digits)
+            (?P<hour_c>\d{2})(?P<minute_c>\d{2})(?P<second_c>\d{2})?
+        )
     )?
     """,
     re.VERBOSE,
@@ -223,9 +227,20 @@ def parse_date_from_filename(filename_stem: str) -> Optional[str]:
         month = int(parts["month"]) 
         day = int(parts["day"])    
 
-        hour = int(parts.get("hour") or 0)
-        minute = int(parts.get("minute") or 0)
-        second = int(parts.get("second") or 0)
+        hour = 0
+        minute = 0
+        second = 0
+
+        if parts.get("hour_sep"):
+            # Separated time: HH:MM[:SS]
+            hour = int(parts["hour_sep"])  
+            minute = int(parts.get("minute_sep") or 0)
+            second = int(parts.get("second_sep") or 0)
+        elif parts.get("hour_c") and parts.get("minute_c"):
+            # Compact time: HHMM[SS]
+            hour = int(parts["hour_c"])  
+            minute = int(parts["minute_c"]) 
+            second = int(parts.get("second_c") or 0)
 
         parsed_dt = datetime(
             year, month, day,
@@ -258,4 +273,3 @@ def correct_file_extension_by_mime(media_file_path: Path) -> Path:
     except Exception:
         pass
     return media_file_path
-
