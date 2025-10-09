@@ -13,9 +13,10 @@ import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 from tqdm import tqdm
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 # Ensure a logs directory exists next to this script
 LOGS_DIR = Path(__file__).parent / "logs"
@@ -84,6 +85,7 @@ def find_media_files(root_directory: Path) -> List[Path]:
     """
     Recursively find all media files under root_directory matching supported extensions.
     """
+    root_directory = Path(root_directory)
     media_file_paths: List[Path] = []
     for candidate in root_directory.rglob("*"):
         if not candidate.is_file():
@@ -97,6 +99,7 @@ def find_json_files(root_directory: Path) -> List[Path]:
     """
     Recursively find all JSON sidecar files under root_directory (ending in .json).
     """
+    root_directory = Path(root_directory)
     json_file_paths: List[Path] = []
     for candidate in root_directory.rglob("*.json"):
         if candidate.suffix.lower() != ".json":
@@ -107,12 +110,10 @@ def find_json_files(root_directory: Path) -> List[Path]:
     return json_file_paths
 
 
-def match_json_for_media(media_file_path: Path, json_file_paths: List[Path]) -> Optional[Path]:
+def build_json_title_index(json_file_paths: List[Path]) -> dict:
     """
-    Match a media file to its JSON sidecar by comparing the JSON's internal title field.
-    Returns the matching Path or None.
+    Build a mapping from JSON internal title stem (lowercase) to JSON path.
     """
-    # Build map: internal title stem (lowercase) -> JSON path
     title_map = {}
     for json_path in json_file_paths:
         try:
@@ -124,14 +125,80 @@ def match_json_for_media(media_file_path: Path, json_file_paths: List[Path]) -> 
                 title_map[stem] = json_path
         except Exception:
             continue
-    # Derive media filename stem and match
+    return title_map
+
+# In-memory cache so we don't re-read every JSON for every media match
+_CACHED_JSON_INDEX: Dict[str, list[Path]] | None = None
+_CACHED_JSON_SET: set[str] | None = None
+
+
+def _normalize_title_to_stems(title: str) -> list[str]:
+    clean = title.replace("\\", "")
+    stem = Path(clean).stem.lower()
+    if not stem:
+        return []
+    stems = {stem}
+    stems.add(re.sub(r"\(\d+\)$", "", stem))  # remove (n)
+    if stem.endswith("-edited"):
+        stems.add(stem[: -len("-edited")])
+    if stem.endswith("ani"):
+        stems.add(stem[:-1])  # '-ani' -> '-an'
+    return [s for s in stems if s]
+
+
+def build_json_title_index(json_file_paths: List[Path]) -> Dict[str, list[Path]]:
+    def parse_one(jpath: Path) -> tuple[list[str], Path] | None:
+        try:
+            data = json.loads(jpath.read_text(encoding="utf-8"))
+            stems = _normalize_title_to_stems(data.get("title", ""))
+            if stems:
+                return stems, jpath
+        except Exception:
+            return None
+        return None
+
+    index: Dict[str, list[Path]] = {}
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 8) as ex:
+        for result in tqdm(ex.map(parse_one, json_file_paths), total=len(json_file_paths),
+                           desc="🧩 Indexing JSON titles", unit="file"):
+            if not result:
+                continue
+            stems, jpath = result
+            for s in stems:
+                index.setdefault(s, []).append(jpath)
+    return index
+
+
+def _ensure_json_index(json_file_paths: List[Path]) -> Dict[str, list[Path]]:
+    global _CACHED_JSON_INDEX, _CACHED_JSON_SET
+    current_set = {str(p) for p in json_file_paths}
+    if _CACHED_JSON_INDEX is None or _CACHED_JSON_SET != current_set:
+        _CACHED_JSON_INDEX = build_json_title_index(json_file_paths)
+        _CACHED_JSON_SET = current_set
+    return _CACHED_JSON_INDEX
+
+
+def match_json_from_index(media_file_path: Path, title_index: Dict[str, list[Path]]) -> Optional[Path]:
+    """
+    Match a media file to its JSON sidecar using a prebuilt title index.
+    """
     media_stem = media_file_path.stem.lower()
-    # Direct match
-    if media_stem in title_map:
-        return title_map[media_stem]
-    # Strip duplicate indicator (n) e.g. "name(1)"
-    stripped_stem = re.sub(r"\(\d+\)$", "", media_stem)
-    return title_map.get(stripped_stem)
+    candidates = (
+        title_index.get(media_stem)
+        or title_index.get(re.sub(r"\(\d+\)$", "", media_stem))
+        or title_index.get(media_stem.rstrip("i"))  # '-ani' -> '-an'
+    )
+    if not candidates:
+        return None
+    for p in candidates:
+        if p.exists():
+            return p
+    return candidates[0]
+
+
+def match_json_for_media(media_file_path: Path, json_file_paths: List[Path]) -> Optional[Path]:
+    title_index = _ensure_json_index(json_file_paths)
+    return match_json_from_index(media_file_path, title_index)
 
 
 def extract_exif_create_date(media_file_path: Path) -> Optional[str]:
@@ -161,26 +228,27 @@ def extract_exif_create_date(media_file_path: Path) -> Optional[str]:
     return None
 
 
-def extract_json_taken_date(media_file_path: Path, json_file_paths: List[Path]) -> Optional[str]:
+def extract_json_taken_date(media_file_path: Path, json_file_paths: List[Path], target_root: Path) -> Optional[str]:
     """
     Read JSON sidecar's photoTakenTime or creationTime timestamp by matching
-    via internal title map. Returns UTC ISO string or None. Moves sidecars to
-    processed or error folders based on success.
-    """
-    #logger.debug(f"Extracting JSON timestamp for {media_file_path}")
-        # Determine a single root directory for all JSON sidecars
-    if json_file_paths:
-        common_root = Path(os.path.commonpath([str(p.parent) for p in json_file_paths]))
-    else:
-        common_root = media_file_path.parent
+    via internal title map. Returns UTC ISO string or None.
 
+    Sidecars are always moved under the provided `target_root`:
+      - <target_root>/json_processed on success
+      - <target_root>/json_error on failure
+    """
     # Find the correct JSON sidecar
     matched_json = match_json_for_media(media_file_path, json_file_paths)
     if not matched_json:
         logger.warning(f"No JSON sidecar matched for {media_file_path}")
         return None
-    
+
     json_path = Path(matched_json)
+    processed_dir = target_root / PROCESSED_JSON_DIR_NAME
+    error_dir = target_root / ERROR_JSON_DIR_NAME
+    processed_dir.mkdir(exist_ok=True)
+    error_dir.mkdir(exist_ok=True)
+
     try:
         sidecar = json.loads(json_path.read_text(encoding="utf-8"))
         timestamp = (
@@ -191,22 +259,34 @@ def extract_json_taken_date(media_file_path: Path, json_file_paths: List[Path]) 
             logger.warning(f"No timestamp field in JSON sidecar {json_path}")
             raise ValueError("No timestamp in JSON sidecar")
 
-        # Move to processed folder in the common root
-        processed_dir = common_root / PROCESSED_JSON_DIR_NAME
-        processed_dir.mkdir(exist_ok=True)
-        json_path.rename(processed_dir / json_path.name)
+        # Move JSON to processed
+        destination = processed_dir / json_path.name
+        try:
+            json_path.rename(destination)
+        except Exception:
+            # If cross-device rename fails, fall back to copy+remove
+            try:
+                destination.write_text(json_path.read_text(encoding="utf-8"), encoding="utf-8")
+                json_path.unlink(missing_ok=True)
+            except Exception:
+                logger.exception(f"Failed to move JSON to processed: {json_path} -> {destination}")
+        logger.info(f"Moved JSON to processed: {destination}")
 
         taken_dt = datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
         return taken_dt.isoformat()
 
     except Exception:
-        # Move to error folder in the common root
-        error_dir = common_root / ERROR_JSON_DIR_NAME
-        error_dir.mkdir(exist_ok=True)
+        # Move JSON to error
+        destination = error_dir / json_path.name
         try:
-            json_path.rename(error_dir / json_path.name)
+            json_path.rename(destination)
         except Exception:
-            logger.exception(f"Failed to extract JSON timestamp for {media_file_path}")
+            try:
+                destination.write_text(json_path.read_text(encoding="utf-8"), encoding="utf-8")
+                json_path.unlink(missing_ok=True)
+            except Exception:
+                logger.exception(f"Failed to move JSON to error: {json_path} -> {destination}")
+        logger.info(f"Moved JSON to error: {destination}")
         return None
 
 
