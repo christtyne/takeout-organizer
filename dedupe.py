@@ -28,8 +28,27 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Set, Tuple
 import sqlite3
 
+import os
+import glob
+import shutil
+import subprocess
+import tempfile
+
 import cv2
 from PIL import Image, ImageOps
+
+# --- Pillow 10 compatibility shim ---
+# Some libraries (e.g., videohash<=X) still reference Image.ANTIALIAS, which
+# was removed in Pillow 10 in favor of Image.Resampling.LANCZOS.
+try:
+    from PIL.Image import Resampling  # Pillow >= 9.1 provides this
+    if not hasattr(Image, "ANTIALIAS"):
+        # Back-compat alias for libs expecting ANTIALIAS
+        Image.ANTIALIAS = Resampling.LANCZOS  # type: ignore[attr-defined]
+except Exception:
+    # On older Pillow versions, Image.ANTIALIAS already exists; ignore.
+    pass
+
 from imagehash import dhash, phash, whash
 from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
@@ -66,6 +85,9 @@ VIDEO_HASH_THRESHOLD: int = 10  # Hamming distance threshold for videohash dupli
 NEAR_MISS_THRESHOLD: int = 8    # if any hash distance <= 8, we still verify via SSIM
 # Wavelet-hash tolerance helps when compression/contrast changes make pHash/dHash diverge
 WHASH_THRESHOLD: int = 6
+
+# Bucket size for pHash prefix to reduce comparisons
+PHASH_BUCKET_PREFIX: int = 4   # compare files only within same leading hex prefix
 
 
 # ----------------------------------
@@ -120,13 +142,90 @@ def _compute_whash_hex(media_file_path: Path) -> str | None:
         return None
 
 
-def compute_video_hash(video_path: Path) -> str | None:
-    """Compute a perceptual video hash using the videohash library."""
+
+# ----------------------------------
+# Video hashing helpers
+# ----------------------------------
+
+def _combine_frame_hashes(hex_hashes: List[str]) -> str:
+    """Combine multiple 64‑bit hex hashes (e.g., pHashes) via majority vote per bit."""
+    ints = [int(h, 16) for h in hex_hashes if h]
+    if not ints:
+        return ""
+    bit_counts = [0] * 64
+    for value in ints:
+        for bit in range(64):
+            if (value >> bit) & 1:
+                bit_counts[bit] += 1
+    threshold = len(ints) / 2.0
+    result = 0
+    for bit in range(64):
+        if bit_counts[bit] > threshold:
+            result |= (1 << bit)
+    return f"{result:016x}"
+
+
+def compute_video_hash(media_file_path: Path) -> str | None:
+    """Compute a perceptual video hash using videohash; fallback to manual frame hashing.
+
+    Primary: videohash.VideoHash (may fail for odd crops on tiny videos).
+    Fallback: extract up to 8 frames with ffmpeg (no crop), pHash each frame,
+    then majority‑vote the 64‑bit bits into one hex digest.
+    """
+    # --- Primary path: videohash ---
     try:
-        vh = VideoHash(path=str(video_path))
-        return str(vh.hash)
+        vh = VideoHash(path=str(media_file_path))
+        value = getattr(vh, "hash", None) or getattr(vh, "hash_hex", None)
+        if value:
+            return str(value)
     except Exception as error:  # pragma: no cover
-        logger.error(f"Failed computing video hash for {video_path}: {error}")
+        logger.error(f"Failed computing video hash for {media_file_path}: {error}")
+        # Continue to fallback
+
+    # --- Fallback path: ffmpeg frame sampling + image pHash combine ---
+    if shutil.which("ffmpeg") is None:
+        logger.error("Fallback video hashing unavailable: ffmpeg not found in PATH")
+        return None
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="vh_fallback_") as tmpdir:
+            frame_pattern = os.path.join(tmpdir, "frame_%03d.jpg")
+            # safe filters: 1 fps sampling, square scale, no crop
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(media_file_path),
+                "-vf", "fps=1,scale=160:160:flags=bicubic",
+                "-frames:v", "8",
+                frame_pattern,
+            ]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode("utf-8", "ignore")
+                logger.error(f"Fallback ffmpeg extraction failed for {media_file_path}: {stderr}")
+                return None
+
+            frames = sorted(glob.glob(os.path.join(tmpdir, "frame_*.jpg")))
+            if not frames:
+                logger.error(f"No frames extracted in fallback for {media_file_path}")
+                return None
+
+            hex_hashes: List[str] = []
+            for frame_path in frames:
+                try:
+                    img = Image.open(frame_path).convert("RGB")
+                    hex_hashes.append(str(phash(img)))
+                except Exception as e:  # pragma: no cover
+                    logger.debug(f"Skipping frame {frame_path}: {e}")
+
+            combined = _combine_frame_hashes(hex_hashes)
+            if not combined:
+                logger.error(f"Failed to combine frame hashes for {media_file_path}")
+                return None
+
+            logger.info(f"Used fallback video hash for {media_file_path}")
+            return combined
+    except Exception as error:  # pragma: no cover
+        logger.error(f"Video hashing fallback crashed for {media_file_path}: {error}")
         return None
 
 
@@ -419,6 +518,5 @@ def find_duplicates(connection: sqlite3.Connection, root_dir: Path) -> List[Dupl
     all_duplicates = [*image_duplicates, *video_duplicates, *date_group_duplicates]
 
     renamed = _rename_all_by_chosen_date(connection, all_duplicates)
-    print(f"\n🔖 Renamed {renamed} file(s) (duplicates marked with _duplicate).")
 
     return all_duplicates

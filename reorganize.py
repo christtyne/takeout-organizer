@@ -68,9 +68,6 @@ def reorganize_files(connection: sqlite3.Connection, output_directory: Path) -> 
             try:
                 shutil.move(str(media_path), str(new_path))
                 # Update database with the new renamed path (point renamed_filepath to new path)
-                print(media_path)
-                print("\n")
-                print(new_path)
                 ok = update_renamed_filepath(connection, media_path, new_path)
                 if not ok:
                     logger.warning(f"⚠️  DB row not matched when updating renamed_filepath for: {media_path}")

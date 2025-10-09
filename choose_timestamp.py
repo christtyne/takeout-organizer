@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 """
 choose_timestamp.py
@@ -56,22 +54,18 @@ def choose_timestamp_for_all(connection: sqlite3.Connection) -> None:
         # choose the oldest date (keep source)
         chosen_datetime, chosen_source = min(parsed_options, key=lambda x: x[0])
 
-        # Only if the winner came from FILENAME and is exactly midnight,
-        # prefer another timestamp on the same date that has time info.
+        # If the winner came from FILENAME and is exactly midnight (00:00:00),
+        # prefer any alternative source (EXIF/JSON) if available—pick the oldest
+        # among those non-filename options.
         if (
-            chosen_source == "filename" and
-            chosen_datetime.hour == 0 and
-            chosen_datetime.minute == 0 and
-            chosen_datetime.second == 0
+            chosen_source == "filename"
+            and chosen_datetime.hour == 0
+            and chosen_datetime.minute == 0
+            and chosen_datetime.second == 0
         ):
-            same_date_with_time = [
-                dt for (dt, src) in parsed_options
-                if dt.date() == chosen_datetime.date() and not (
-                    dt.hour == 0 and dt.minute == 0 and dt.second == 0
-                )
-            ]
-            if same_date_with_time:
-                chosen_datetime = min(same_date_with_time)
+            non_filename_options = [(dt, src) for (dt, src) in parsed_options if src != "filename"]
+            if non_filename_options:
+                chosen_datetime, _ = min(non_filename_options, key=lambda x: x[0])
         chosen_string = chosen_datetime.strftime("%Y-%m-%d_%H-%M-%S")
 
         # update the database with the chosen date
