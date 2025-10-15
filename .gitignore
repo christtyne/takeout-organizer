@@ -163,6 +163,8 @@ coverage.xml
 logs/
 *.db
 media_catalog.db
+media_catalog.db-shm
+media_catalog.db-wal
 
 # Backup and temp files
 *~

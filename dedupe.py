@@ -7,7 +7,7 @@ This module identifies visual duplicates using a perceptual-hash prefilter
 For videos, it relies on a perceptual **videohash** (computed earlier in the
 pipeline) and flags near-duplicates by Hamming distance.
 
-After classification, it renames **all** files to their `chosen_date` (already
+After classification, it renames **all** files to their `chosen_timestamp` (already
 formatted by `choose_timestamp.py`), appending "_duplicate" for files that
 were marked as duplicates. Each rename is recorded in the database via the
 `renamed_filepath` column.
@@ -15,7 +15,7 @@ were marked as duplicates. Each rename is recorded in the database via the
 Best‑practices applied:
 - Strong type hints and cohesive helper functions
 - Explicit constants for thresholds and paths
-- Robust logging with a rotating file handler
+- Centralized per-module file logger (no duplicate handlers)
 - Clear separation of: loading entries → comparing → renaming
 - Defensive updates to the catalog (SSIM stored for both image files)
 """
@@ -23,10 +23,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Sequence, Set, Tuple
 import sqlite3
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import lru_cache
 
 import os
 import glob
@@ -53,25 +54,25 @@ from imagehash import dhash, phash, whash
 from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 
-from catalog import update_renamed_filepath, update_ssim_score
+from catalog import ensure_indexes, batch_update_ssim, batch_update_renamed_filepath
 from videohash import VideoHash
 
 
 # ----------------------------------
 # Configuration & logging
 # ----------------------------------
-LOGS_DIR = Path(__file__).parent / "logs"
+LOGS_DIR = Path(__file__).resolve().parent / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
-
-LOG_FILE = LOGS_DIR / "hash_duplicates.log"
+LOG_FILE = LOGS_DIR / f"{Path(__file__).stem}.log"
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-if not logger.handlers:
-    # rotate at ~2MB, keep a couple of backups
-    _fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=2, encoding="utf-8")
+logger.setLevel(logging.ERROR)  # only log errors and above
+if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == str(LOG_FILE) for h in logger.handlers):
+    _fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    _fh.setLevel(logging.ERROR)  # ensure handler filters to errors
     _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(_fh)
+
 
 # Tunable thresholds (images)
 PHASH_THRESHOLD: int = 3      # Hamming distance threshold for pHash
@@ -133,11 +134,35 @@ def compute_perceptual_hashes(media_file_path: Path) -> Tuple[str | None, str | 
         return None, None
 
 
+
 def _compute_whash_hex(media_file_path: Path) -> str | None:
     try:
         image = Image.open(media_file_path)
         image = ImageOps.exif_transpose(image).convert("RGB")
         return str(whash(image))
+    except Exception:
+        return None
+
+
+# --- Cached helpers for geometry and wavelet hash ---
+@lru_cache(maxsize=100_000)
+def _compute_whash_hex_cached(path_str: str) -> str | None:
+    """Memoized wHash to avoid recomputation during near-miss checks."""
+    try:
+        return _compute_whash_hex(Path(path_str))
+    except Exception:
+        return None
+
+@lru_cache(maxsize=100_000)
+def get_image_shape(path_str: str) -> Tuple[int, int] | None:
+    """
+    Fast header-only image dimension lookup using Pillow.
+    Returns (height, width) or None on failure.
+    """
+    try:
+        with Image.open(path_str) as im:
+            w, h = im.size
+            return (h, w)
     except Exception:
         return None
 
@@ -249,27 +274,24 @@ def compute_ssim_score(path_a: Path, path_b: Path) -> float:
         return float(ssim(a_small, b_small, data_range=255))
     except Exception:
         return 0.0
+    
 
-
-def make_unique_path(parent_directory: Path, base_name: str, extension: str, original_file_path: Path | None = None) -> Path:
-    """Return a unique path `base_name+extension` in `parent_directory`.
-
-    If a collision exists, append `(n)` before the extension. If `candidate` is
-    the same file as `original_file_path`, return the candidate (no-op).
-    """
-    candidate = parent_directory / f"{base_name}{extension}"
+def make_unique_path(dest_dir: Path, stem: str, suffix: str, original: Path | None = None) -> Path:
+    candidate = dest_dir / f"{stem}{suffix}"
+    if not candidate.exists():
+        return candidate
+    # allow if it’s the same file (e.g., case-only change)
     try:
-        if not candidate.exists() or (original_file_path and candidate.exists() and candidate.samefile(original_file_path)):
+        if original and candidate.exists() and candidate.samefile(original):
             return candidate
     except Exception:
-        if not candidate.exists():
-            return candidate
-    index = 1
+        pass
+    i = 1
     while True:
-        numbered = parent_directory / f"{base_name}({index}){extension}"
+        numbered = dest_dir / f"{stem} ({i}){suffix}"
         if not numbered.exists():
             return numbered
-        index += 1
+        i += 1
 
 
 # ----------------------------------
@@ -294,61 +316,123 @@ def _bucket_by_phash_prefix(entries: Sequence[HashedEntry], prefix_len: int = PH
     for entry in entries:
         key = entry.phash_hex[:max(0, prefix_len)]
         buckets.setdefault(key, []).append(entry)
-    return buckets
+    # Sort buckets by size descending so we handle large ones first
+    return dict(sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True))
 
 
 def _find_duplicate_pairs(connection: sqlite3.Connection, entries: Sequence[HashedEntry]) -> List[DuplicateRecord]:
-    """Return a list of DuplicateRecord identified among `entries` (images only).
+    """Return DuplicateRecord list identified among `entries` (images only), parallelizing SSIM checks.
 
-    Strategy: Within each pHash prefix bucket, compare pairs with small
-    Hamming distance on both pHash and dHash, then verify by SSIM. Record SSIM
-    for both files, regardless of duplicate decision, for later analysis.
+    Strategy
+    --------
+    1) Partition by pHash prefix to keep candidate sets small.
+    2) Within each bucket, compare hashes to form a list of *candidates* that need SSIM.
+       We only enqueue SSIM when (strict) both pHash and dHash within threshold OR
+       (near_miss) min distance within NEAR_MISS_THRESHOLD **and** wHash also close.
+    3) Compute SSIM in parallel using a ProcessPoolExecutor (CPU bound).
+    4) Update the DB and assemble duplicates on the main process to keep the SQLite
+       connection thread/fork safe.
     """
     duplicates: List[DuplicateRecord] = []
     visited: Set[Path] = set()
 
     buckets = _bucket_by_phash_prefix(entries)
+    ssim_jobs: List[Tuple[Path, Path]] = []
 
-    for _key, bucket in tqdm(buckets.items(), desc="🔍 Comparing images", unit="bucket"):
-        # local nested loop within bucket
-        for i, left in enumerate(bucket):
-            if left.path in visited:
-                continue
-            for right in bucket[i + 1 : ]:
-                if right.path in visited:
+    # --- Stage 1: hash-only prefilter to build SSIM jobs ---
+    for _key, bucket in tqdm(buckets.items(), desc="🔍 Hash prefilter (images)", unit="bucket", leave=False):
+        # Adaptively split very large buckets by a longer prefix to reduce O(n^2)
+        buckets_to_process: List[List[HashedEntry]] = []
+        if len(bucket) > 2000:
+            sub: Dict[str, List[HashedEntry]] = {}
+            for e in bucket:
+                sub.setdefault(e.phash_hex[:6], []).append(e)
+            buckets_to_process = list(sub.values())
+        else:
+            buckets_to_process = [bucket]
+
+        for sub_bucket in buckets_to_process:
+            local_visited: Set[Path] = set()
+            for i, left in enumerate(sub_bucket):
+                if left.path in visited or left.path in local_visited:
                     continue
-
-                # --- Quick/soft gates: compute distances once ---
-                d_ph = _hamming_hex(left.phash_hex, right.phash_hex)
-                d_dh = _hamming_hex(left.dhash_hex, right.dhash_hex)
-
-                strict_pass = (d_ph <= PHASH_THRESHOLD and d_dh <= DHASH_THRESHOLD)
-                near_miss = (min(d_ph, d_dh) <= NEAR_MISS_THRESHOLD)
-
-                if not (strict_pass or near_miss):
-                    continue
-
-                # If strict didn't pass, use wavelet-hash as a robustness cue
-                if not strict_pass and near_miss:
-                    w1 = _compute_whash_hex(left.path)
-                    w2 = _compute_whash_hex(right.path)
-                    if not (w1 and w2) or _hamming_hex(w1, w2) > WHASH_THRESHOLD:
-                        # wHash says they are far apart → skip
+                for right in sub_bucket[i + 1:]:
+                    if right.path in visited or right.path in local_visited:
                         continue
 
-                # Verify: SSIM (store it for both rows)
-                ssim_score = compute_ssim_score(left.path, right.path)
-                logger.debug(f"SSIM {ssim_score:.3f}: {left.path} vs {right.path}")
-                try:
-                    _ = update_ssim_score(connection, left.path, ssim_score)
-                    _ = update_ssim_score(connection, right.path, ssim_score)
-                except Exception as error:  # pragma: no cover
-                    logger.error(f"SSIM DB update failed for {left.path} / {right.path}: {error}")
+                    d_ph = _hamming_hex(left.phash_hex, right.phash_hex)
+                    d_dh = _hamming_hex(left.dhash_hex, right.dhash_hex)
 
-                if ssim_score >= SSIM_THRESHOLD:
-                    duplicates.append(DuplicateRecord(keep_path=left.path, duplicate_path=right.path, score=ssim_score))
-                    visited.add(right.path)
-            visited.add(left.path)
+                    strict_pass = (d_ph <= PHASH_THRESHOLD and d_dh <= DHASH_THRESHOLD)
+                    if not strict_pass:
+                        # Near-miss path: require a supportive wavelet-hash agreement
+                        if min(d_ph, d_dh) > NEAR_MISS_THRESHOLD:
+                            continue
+                        w1 = _compute_whash_hex_cached(str(left.path))
+                        w2 = _compute_whash_hex_cached(str(right.path))
+                        if not (w1 and w2) or _hamming_hex(w1, w2) > WHASH_THRESHOLD:
+                            continue
+
+                    # Lightweight geometry check using cached header dimensions
+                    try:
+                        sh_left = get_image_shape(str(left.path))
+                        sh_right = get_image_shape(str(right.path))
+                        if not sh_left or not sh_right:
+                            continue
+                        ha, wa = sh_left
+                        hb, wb = sh_right
+                        if (max(ha, hb) / max(1, min(ha, hb)) > 3.0) or (max(wa, wb) / max(1, min(wa, wb)) > 3.0):
+                            continue
+                    except Exception:
+                        pass
+
+                    ssim_jobs.append((left.path, right.path))
+                local_visited.add(left.path)
+
+    # --- Stage 2: Parallel SSIM for candidates ---
+    def _ssim_worker(args: Tuple[Path, Path]) -> Tuple[Path, Path, float]:
+        a, b = args
+        return a, b, compute_ssim_score(a, b)
+
+    # Nothing to do?
+    if not ssim_jobs:
+        return []
+
+    results: List[Tuple[Path, Path, float]] = []
+    with ProcessPoolExecutor(max_workers=max(1, (os.cpu_count() or 2) - 1)) as pool:
+        futures = {pool.submit(_ssim_worker, job): job for job in ssim_jobs}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="🧮 SSIM (parallel)", unit="pair", leave=False):
+            try:
+                results.append(fut.result())
+            except Exception:
+                # Ignore failed jobs; treat as non-duplicates
+                pass
+
+    # --- Stage 3: DB updates and final decisions (main process) ---
+    seen_pairs: Set[frozenset[Path]] = set()
+    duplicates: List[DuplicateRecord] = []
+    rows_to_update: Set[Tuple[float, str]] = set()
+
+    for a_path, b_path, score in results:
+        pair_key = frozenset((a_path, b_path))
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+
+        # accumulate SSIM updates for both files
+        rows_to_update.add((score, str(a_path)))
+        rows_to_update.add((score, str(b_path)))
+
+        if score >= SSIM_THRESHOLD:
+            duplicates.append(DuplicateRecord(keep_path=a_path, duplicate_path=b_path, score=score))
+            visited.add(b_path)
+
+    # Batch-commit SSIM scores (best-effort)
+    if rows_to_update:
+        try:
+            batch_update_ssim(connection, list(rows_to_update))
+        except Exception as error:  # pragma: no cover
+            logger.error(f"SSIM DB batch update failed for {len(rows_to_update)} rows: {error}")
 
     return duplicates
 
@@ -375,13 +459,30 @@ def _find_duplicate_videos(connection: sqlite3.Connection) -> List[DuplicateReco
     if not pairs:
         return []
 
+    # Mark exact hash duplicates first
+    by_hash: Dict[str, List[Tuple[Path, str]]] = {}
+    for p, h in pairs:
+        by_hash.setdefault(h, []).append((p, h))
+
+    duplicates: List[DuplicateRecord] = []
+    visited: Set[Path] = set()
+    for h, items in by_hash.items():
+        if len(items) > 1:
+            keep = items[0][0]
+            for p, _ in items[1:]:
+                duplicates.append(DuplicateRecord(keep_path=keep, duplicate_path=p, score=1.0))
+                visited.add(p)
+
+    # Continue with near-miss matching on the remaining items
+    pairs = [(p, h) for p, h in pairs if p not in visited]
+    if not pairs:
+        return duplicates
+
     # bucket videos by prefix to reduce comparisons
     buckets: Dict[str, List[Tuple[Path, str]]] = {}
     for p, h in pairs:
         buckets.setdefault(h[:4], []).append((p, h))
 
-    duplicates: List[DuplicateRecord] = []
-    visited: Set[Path] = set()
     for _key, bucket in tqdm(buckets.items(), desc="🎞️ Comparing videos", unit="bucket"):
         for i, (a_path, a_hash) in enumerate(bucket):
             if a_path in visited:
@@ -397,47 +498,76 @@ def _find_duplicate_videos(connection: sqlite3.Connection) -> List[DuplicateReco
     return duplicates
 
 
-def _find_duplicates_same_chosen_date(connection: sqlite3.Connection) -> List[DuplicateRecord]:
-    """Within each chosen_date group, verify pairs by SSIM.
+def _find_duplicates_same_chosen_timestamp(connection: sqlite3.Connection) -> List[DuplicateRecord]:
+    """Within each chosen_timestamp group, verify pairs by SSIM in parallel.
 
     This catches cases where hashing differs due to recompression/processing,
     but the timestamp base name collides.
     """
     cursor = connection.cursor()
-    cursor.execute("SELECT filepath, chosen_date FROM media WHERE chosen_date IS NOT NULL")
+    cursor.execute("SELECT filepath, chosen_timestamp FROM media WHERE chosen_timestamp IS NOT NULL")
     rows = cursor.fetchall()
 
-    # Build groups by chosen_date
+    # Build groups by chosen_timestamp
     groups: Dict[str, List[Path]] = {}
     for fp_str, chosen in rows:
         p = Path(fp_str)
         if p.exists() and chosen:
             groups.setdefault(chosen, []).append(p)
 
-    duplicates: List[DuplicateRecord] = []
-    seen_pairs: Set[frozenset[Path]] = set()
-
-    for _, paths in groups.items():
+    # Build candidate pairs
+    jobs: List[Tuple[Path, Path]] = []
+    for paths in groups.values():
         if len(paths) < 2:
             continue
-        # pairwise SSIM check within the group
+        # Heuristic: sort by file size (if available) so near sizes are adjacent and more likely
+        try:
+            paths = sorted(paths, key=lambda p: p.stat().st_size)
+        except Exception:
+            paths = list(paths)
         for i in range(len(paths)):
             for j in range(i + 1, len(paths)):
                 a, b = paths[i], paths[j]
-                key = frozenset((a, b))
-                if key in seen_pairs:
-                    continue
-                seen_pairs.add(key)
+                jobs.append((a, b))
 
-                ssim_score = compute_ssim_score(a, b)
-                try:
-                    _ = update_ssim_score(connection, a, ssim_score)
-                    _ = update_ssim_score(connection, b, ssim_score)
-                except Exception:
-                    pass
+    if not jobs:
+        return []
 
-                if ssim_score >= SSIM_THRESHOLD:
-                    duplicates.append(DuplicateRecord(keep_path=a, duplicate_path=b, score=ssim_score))
+    def _ssim_worker(args: Tuple[Path, Path]) -> Tuple[Path, Path, float]:
+        a, b = args
+        return a, b, compute_ssim_score(a, b)
+
+    results: List[Tuple[Path, Path, float]] = []
+    with ProcessPoolExecutor(max_workers=max(1, (os.cpu_count() or 2) - 1)) as pool:
+        futures = {pool.submit(_ssim_worker, job): job for job in jobs}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="📆 SSIM same‑timestamp", unit="pair", leave=False):
+            try:
+                results.append(fut.result())
+            except Exception:
+                pass
+
+    duplicates: List[DuplicateRecord] = []
+    seen_pairs: Set[frozenset[Path]] = set()
+    rows_to_update: Set[Tuple[float, str]] = set()
+
+    for a, b, score in results:
+        key = frozenset((a, b))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+
+        rows_to_update.add((score, str(a)))
+        rows_to_update.add((score, str(b)))
+
+        if score >= SSIM_THRESHOLD:
+            duplicates.append(DuplicateRecord(keep_path=a, duplicate_path=b, score=score))
+
+    if rows_to_update:
+        try:
+            batch_update_ssim(connection, list(rows_to_update))
+        except Exception as error:
+            logger.error(f"SSIM DB batch update (same-timestamp) failed for {len(rows_to_update)} rows: {error}")
+
     return duplicates
 
 
@@ -445,28 +575,28 @@ def _find_duplicates_same_chosen_date(connection: sqlite3.Connection) -> List[Du
 # Renaming
 # ----------------------------------
 
-def _rename_all_by_chosen_date(
+def _rename_all_by_chosen_timestamp(
     connection: sqlite3.Connection,
     duplicates: Sequence[DuplicateRecord],
 ) -> int:
-    """Rename all files to `chosen_date` as base name; mark duplicates with `_duplicate`.
+    """Rename all files to `chosen_timestamp` as base name; mark duplicates with `_duplicate`.
 
     Returns the number of files actually renamed.
     """
     cursor = connection.cursor()
-    cursor.execute("SELECT filepath, chosen_date FROM media")
+    cursor.execute("SELECT filepath, chosen_timestamp FROM media")
     rows: List[Tuple[str, str | None]] = cursor.fetchall()
 
     duplicate_set: Set[Path] = {rec.duplicate_path for rec in duplicates}
 
     renamed_count = 0
-    for filepath_str, chosen_str in tqdm(rows, desc="✏️ Renaming by chosen_date", unit="file"):
+    for filepath_str, chosen_str in tqdm(rows, desc="✏️ Renaming by chosen_timestamp", unit="file"):
         file_path = Path(filepath_str)
         if not file_path.exists():
-            logger.warning(f"File not found on disk, skipping rename: {file_path}")
+            logger.error(f"File not found on disk, skipping rename: {file_path}")
             continue
         if not chosen_str:
-            logger.warning(f"No chosen_date in DB for {file_path}; skipping rename")
+            logger.error(f"No chosen_timestamp in DB for {file_path}; skipping rename")
             continue
 
         base_name = chosen_str
@@ -474,15 +604,20 @@ def _rename_all_by_chosen_date(
             base_name = f"{base_name}_duplicate"
 
         extension = file_path.suffix.lower()
-        new_path = make_unique_path(file_path.parent, base_name, extension, original_file_path=file_path)
+        # FIX: correct keyword argument is `original`, not `original_file_path`
+        new_path = make_unique_path(file_path.parent, base_name, extension, original=file_path)
 
         if new_path != file_path:
             try:
                 file_path.rename(new_path)
-                # Keep catalog in sync
-                ok = update_renamed_filepath(connection, file_path, new_path)
-                if not ok:
-                    logger.warning(f"DB row not matched when updating renamed_filepath for: {file_path}")
+                # Use batch helper even for a single row for consistency
+                try:
+                    updated = batch_update_renamed_filepath(connection, [(str(new_path), str(file_path))])
+                except Exception as e:
+                    updated = 0
+                    logger.error(f"DB update failed for renamed_filepath {file_path} → {new_path}: {e}")
+                if updated == 0:
+                    logger.error(f"DB row not matched when updating renamed_filepath for: {file_path}")
                 logger.info(f"Renamed {file_path} → {new_path}")
                 renamed_count += 1
             except Exception as error:  # pragma: no cover
@@ -501,7 +636,9 @@ def find_duplicates(connection: sqlite3.Connection, root_dir: Path) -> List[Dupl
     `root_dir` is accepted for API compatibility but not used directly because
     we rely on the catalog’s file list. The function returns the list of
     `DuplicateRecord` found.
+    This function now parallelizes SSIM across CPU cores and ensures helpful DB indexes exist.
     """
+    ensure_indexes(connection)
     # Image duplicates
     image_entries = _load_hashed_entries(connection)
     if not image_entries:
@@ -511,12 +648,11 @@ def find_duplicates(connection: sqlite3.Connection, root_dir: Path) -> List[Dupl
     # Video duplicates (based on videohash)
     video_duplicates = _find_duplicate_videos(connection)
 
-    # Duplicates from identical chosen_date groups (SSIM‑verified)
-    date_group_duplicates = _find_duplicates_same_chosen_date(connection)
+    # Duplicates from identical chosen_timestamp groups (SSIM‑verified)
+    date_group_duplicates = _find_duplicates_same_chosen_timestamp(connection)
 
     # Merge all sources
     all_duplicates = [*image_duplicates, *video_duplicates, *date_group_duplicates]
 
-    renamed = _rename_all_by_chosen_date(connection, all_duplicates)
-
+    renamed = _rename_all_by_chosen_timestamp(connection, all_duplicates)
     return all_duplicates

@@ -2,56 +2,93 @@
 """
 clean_empty_folders.py
 
-Recursively deletes any directory that is empty or contains only a .DS_Store file.
+Recursively deletes directories that are empty or contain only ignorable files
+(.DS_Store, metadata.json). Logs to logs/clean_empty_folders.log.
 """
 
 from pathlib import Path
+from typing import Iterable, Optional
+import logging
+import os
 from tqdm import tqdm
 
-def clean_empty_folders(target_directory: Path) -> None:
-    """
-    Walk through all subdirectories of target_directory in reverse order (deepest first).
-    Delete a directory if it is empty or contains only a '.DS_Store' file.
-    """
+# Centralized logs directory at project root
+LOGS_DIR = Path(__file__).resolve().parent / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOGS_DIR / f"{Path(__file__).stem}.log"
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.ERROR)  # only log errors and above
+if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == str(LOG_FILE) for h in logger.handlers):
+    handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    handler.setLevel(logging.ERROR)  # ensure handler filters to errors
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+
+# Files that do not count as content when deciding if a folder is empty
+IGNORABLE = {".DS_Store", "metadata.json", "Thumbs.db"}
+
+
+def clean_empty_folders(target_directory: Path, *, dry_run: bool = False, extra_ignorable: Optional[Iterable[str]] = None) -> int:
+    """
+    Walk the tree bottom-up and remove directories that are empty or contain only ignorable files.
+    Supports a dry-run mode and optional extra ignorable filenames.
+    Returns the number of directories removed.
+    """
+    target_directory = Path(target_directory)
+
+    ignorable = set(IGNORABLE)
+    if extra_ignorable:
+        ignorable.update(extra_ignorable)
+
+    # Stream directories bottom-up using os.walk (avoids holding all paths in memory)
     removed_count = 0
-    # Gather all directories, sorted deepest-first
-    all_directories = sorted(
-        [p for p in target_directory.rglob('*') if p.is_dir()],
-        key=lambda p: len(str(p)),
-        reverse=True
-    )
+    # We don't have a fixed total without a full pre-scan, so let tqdm be indeterminate
+    for root, dirs, files in os.walk(target_directory, topdown=False):
+        directory = Path(root)
+        # progress display (one tick per directory)
+        tqdm.write(f"")  # ensure tqdm initializes cleanly in some terminals
+        with tqdm(total=None, desc="🧹 Cleaning empty folders", unit="dir", leave=False) as _pbar:
+            break  # create once
+    # Re-run the actual walk now that tqdm is initialized
+    with tqdm(total=None, desc="🧹 Cleaning empty folders", unit="dir", leave=False) as pbar:
+        for root, dirs, files in os.walk(target_directory, topdown=False):
+            directory = Path(root)
+            pbar.update(1)
 
-    IGNORABLE = {'.DS_Store', 'metadata.json'}
+            # Prevent deletion of the root directory itself
+            if directory == target_directory:
+                continue
+            try:
+                # Collect entries and filter out ignorable files
+                entries = list(directory.iterdir())
+                non_ignorable = [e for e in entries if not (e.is_file() and e.name in ignorable)]
 
-    for directory in tqdm(all_directories, desc="Cleaning empty folders", unit="folder"):
-        # Prevent deletion of the root directory itself
-        if directory == target_directory:
-            continue
-        try:
-            # Ignore .DS_Store and metadata.json when checking for content
-            children = [
-                child for child in directory.iterdir()
-                if not (child.is_file() and child.name in IGNORABLE)
-            ]
+                if not non_ignorable:
+                    if not dry_run:
+                        for e in entries:
+                            if e.is_file() and e.name in ignorable:
+                                try:
+                                    e.unlink()
+                                except Exception as error:
+                                    logger.error(f"Could not remove ignorable file {e}: {error}")
+                        try:
+                            directory.rmdir()
+                            removed_count += 1
+                            logger.error(f"Removed empty folder: {directory}")
+                        except Exception as error:
+                            logger.error(f"Could not remove directory {directory}: {error}")
+                    else:
+                        # Dry-run: count as would-remove, but make no changes
+                        removed_count += 1
 
-            if not children:
-                # Remove ignorable files if present
-                for name in IGNORABLE:
-                    file = directory / name
+            except Exception as error:
+                # Skip any directory we cannot remove, but log it for diagnostics
+                logger.error(f"Skipped directory {directory}: {error}")
 
-                    if file.exists():
-                        file.unlink()
-
-                # Remove the empty directory
-                directory.rmdir()
-                removed_count += 1
-
-        except Exception:
-            # Skip any directory we cannot remove
-            pass
-    
     if removed_count == 0:
         print(f"\n✅ No empty folders found in {target_directory}")
-
-    print(f"\n🗑 Removed {removed_count} empty folders")
+    else:
+        action = "Would remove" if dry_run else "Removed"
+        print(f"\n🗑️ {action} {removed_count} empty folder(s)")
+    return removed_count
